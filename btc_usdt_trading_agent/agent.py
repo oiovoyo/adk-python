@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 
 from btc_usdt_trading_agent.tools.binance_data_tool import BinanceDataTool
 from btc_usdt_trading_agent.account.trading_account import TradingAccount
+from btc_usdt_trading_agent.tools.news_fetch_tool import get_crypto_news # Import the new tool
 
 
 class TradingDecision(BaseModel):
@@ -45,7 +46,7 @@ class TradingAgent(LlmAgent[TradingDecision, BaseAgentResponse[TradingDecision]]
             model_name: The name of the LLM model to use (e.g., "gemini-1.5-flash").
         """
         self.trading_account = trading_account
-        self.binance_data_tool = BinanceDataTool() # API key/secret handled by tool if needed
+        self.binance_data_tool = BinanceDataTool() 
 
         tools = [
             FunctionTool(
@@ -57,18 +58,28 @@ class TradingAgent(LlmAgent[TradingDecision, BaseAgentResponse[TradingDecision]]
                 func=self.binance_data_tool.get_candlestick_data,
                 name="get_candlestick_data",
                 description="Fetches recent candlestick (k-line) data for a cryptocurrency symbol from Binance. Example: {\"symbol\": \"BTCUSDT\", \"interval\": \"1h\", \"limit\": 24}"
+            ),
+            FunctionTool( # New NewsFetchTool
+                func=get_crypto_news, # Directly use the imported async function
+                name="get_cryptocurrency_news",
+                description="Fetches recent news articles related to a specific cryptocurrency or market trend. Use queries like 'bitcoin price sentiment', 'ethereum new projects', or 'overall crypto market trends'. Example: {\"query\": \"bitcoin price sentiment\", \"num_results\": 3}"
             )
         ]
 
-        instruction = """\
+        # Store the instruction template. It will be formatted dynamically.
+        self._original_instruction = """\
 You are a cryptocurrency trading analyst. Your goal is to maximize the USDT value of a simulated trading account.
 
 Current Account Balance:
 USDT: {usdt_balance}
 BTC: {btc_balance}
 
-You will be provided with the current BTC/USDT ticker price and recent candlestick data using your available tools.
-Based on your analysis of the provided data and the current account balance, you must decide whether to BUY BTC, SELL BTC, or HOLD.
+You have access to the following tools to gather market data:
+1. `get_ticker_price(symbol: str)`: Fetches the latest price for a cryptocurrency symbol.
+2. `get_candlestick_data(symbol: str, interval: str = '1h', limit: int = 24)`: Fetches recent candlestick (k-line) data.
+3. `get_cryptocurrency_news(query: str, num_results: int = 3)`: Fetches recent news articles. Use this to understand market sentiment or find news that might impact prices (e.g., query 'bitcoin price sentiment' or 'ethereum new regulations').
+
+Based on your analysis of all available data (ticker price, candlestick patterns, and relevant news), you must decide whether to BUY BTC, SELL BTC, or HOLD.
 
 Decision Guidelines:
 1.  If you decide to BUY BTC:
@@ -84,7 +95,7 @@ Decision Guidelines:
     *   This is appropriate if no clear opportunity is present or the market is too volatile without clear direction.
 
 Reasoning:
-You MUST provide a clear and concise reason for your decision, based on your analysis of the market data (candlestick patterns, trends, support/resistance levels, significant price movements).
+You MUST provide a clear and concise reason for your decision, based on your analysis of the market data (candlestick patterns, trends, support/resistance levels, significant price movements, and news sentiment).
 
 Output Format:
 Your final decision MUST be structured as a JSON object conforming to the following schema:
@@ -96,18 +107,16 @@ Your final decision MUST be structured as a JSON object conforming to the follow
 }}
 
 Example Decisions:
-- Buying: {{"action": "BUY", "amount_usdt_to_spend": 200.0, "amount_btc_to_sell": 0.0, "reason": "Price bounced off support at 60000 and shows upward momentum based on candlestick analysis."}}
-- Selling: {{"action": "SELL", "amount_usdt_to_spend": 0.0, "amount_btc_to_sell": 0.01, "reason": "Candlestick pattern (e.g., bearish engulfing) indicates a potential reversal after a strong rally to resistance at 65000."}}
-- Holding: {{"action": "HOLD", "amount_usdt_to_spend": 0.0, "amount_btc_to_sell": 0.0, "reason": "Market is consolidating within a tight range (61000-62000), no clear entry or exit signal."}}
+- Buying: {{"action": "BUY", "amount_usdt_to_spend": 200.0, "amount_btc_to_sell": 0.0, "reason": "Price bounced off support at 60000, RSI is oversold, and recent positive news about Bitcoin adoption suggests upward potential."}}
+- Selling: {{"action": "SELL", "amount_usdt_to_spend": 0.0, "amount_btc_to_sell": 0.01, "reason": "Bearish engulfing pattern on 1h chart at resistance 65000, coupled with negative regulatory news."}}
+- Holding: {{"action": "HOLD", "amount_usdt_to_spend": 0.0, "amount_btc_to_sell": 0.0, "reason": "Market is consolidating (61000-62000), news is mixed, awaiting clearer signal."}}
 
-The system will execute valid BUY or SELL trades on your behalf using a simulated account and will inform you of the outcome. Focus on maximizing the overall USDT value of the account.
-Always use your tools to get the latest market data before making a decision.
+Always use your tools to get the latest market data before making a decision. Consider all available data (price, candlesticks, news) for a comprehensive analysis.
 """
-        # The instruction will be formatted with current balances before each LLM call
-        # in the _run_async_impl or a suitable callback.
-
+        # The instruction passed to super() will be formatted dynamically in _run_async_impl or a callback.
+        # For now, pass the template; LlmAgent expects an instruction string.
         super().__init__(
-            instruction=instruction, # This will be dynamically formatted
+            instruction=self._original_instruction, # Will be formatted before each LLM call
             tools=tools,
             model=model_name,
             output_schema=TradingDecision,
@@ -121,72 +130,60 @@ Always use your tools to get the latest market data before making a decision.
     ) -> AsyncGenerator[BaseAgentResponse[TradingDecision], None]:
         """
         Core logic for the TradingAgent.
-        This method is called by the LlmAgent's default flow.
-        It will format the instruction with current balance, let the LLM make a decision,
-        then process that decision.
+        Formats instruction with current balance, lets LLM make a decision, then processes it.
         """
-        
-        # 1. Format instruction with current balance
         current_balances = self.trading_account.get_balance()
-        formatted_instruction = self.instruction.format(
-            usdt_balance=current_balances["usdt_balance"],
-            btc_balance=current_balances["btc_balance"]
+        formatted_instruction = self._original_instruction.format(
+            usdt_balance=f"{current_balances['usdt_balance']:.2f}", # Format for readability
+            btc_balance=f"{current_balances['btc_balance']:.8f}"  # Format for readability
         )
-        # Update the instruction in the request for the LLM.
-        # Note: LlmAgent's internal request might need specific handling
-        # or use a before_model_callback to achieve this.
-        # For simplicity, we'll assume the LlmAgent uses the latest self.instruction.
-        # A more robust way is to modify the LlmRequest directly if possible, or use a callback.
         
-        # Store the original instruction template
-        original_instruction_template = self.instruction
-        self.instruction = formatted_instruction # Temporarily set for this run
+        # Create a new LlmRequest with the formatted instruction for this specific run.
+        # This is a cleaner way than modifying self.instruction directly.
+        # The LlmAgent's run_async flow should ideally use the instruction from the request object.
+        # We assume that the LlmAgent uses request.instruction if provided,
+        # or falls back to self.instruction. If `request` is directly mutated, it works.
+        # If not, LlmAgent might need a specific way to update instruction per run.
+        
+        # For simplicity in this context, we'll rely on the LlmAgent using its `self.instruction`.
+        # We'll set it for this run and then restore it.
+        # A more robust ADK pattern would use a callback like `before_llm_request_callback`
+        # to modify the instruction in the LlmRequest just before the API call.
+        
+        original_agent_instruction = self.instruction # Save agent's base instruction
+        self.instruction = formatted_instruction     # Set dynamically formatted one for this run
 
-        # 2. Let the LlmAgent's default flow handle tool use and LLM interaction
-        # The LlmAgent's `run_async` will call `_run_llm_async` which uses `self.instruction`.
         llm_decision_response: TradingDecision | None = None
         
+        # The super()._run_async_impl will use the tools and the (now dynamically formatted) self.instruction
         async for event in super()._run_async_impl(request, execution_context):
-            yield event # Yield all events from the parent class (tool calls, LLM responses)
+            yield event
             if event.response_type == "llm_response" and event.response_data:
-                # Assuming the final LLM response data is the TradingDecision
-                # This might need adjustment based on how LlmAgent structures its final output event
                 if isinstance(event.response_data, TradingDecision):
                      llm_decision_response = event.response_data
-                elif isinstance(event.response_data, dict) and "action" in event.response_data : # If it's a dict from LLM
+                elif isinstance(event.response_data, dict) and "action" in event.response_data:
                     try:
                         llm_decision_response = TradingDecision(**event.response_data)
                     except Exception:
-                        # LLM output was not a valid TradingDecision
-                        # This case should ideally be handled by LlmAgent's retry/error mechanisms
-                        # or by yielding a specific error event.
-                        # For now, we'll just note it and proceed without action.
                         yield BaseAgentResponse(
                             response_type="agent_error",
                             response_data={"error": "LLM output did not conform to TradingDecision schema after tool use.", "raw_output": event.response_data},
                             raw_request=request,
                             raw_response=None 
                         )
-                        llm_decision_response = None # Ensure it's None
+                        llm_decision_response = None
                         break 
 
-        # Restore original instruction template
-        self.instruction = original_instruction_template
+        self.instruction = original_agent_instruction # Restore original instruction template
 
-        # 3. Process the LLM's final decision
         if llm_decision_response:
             decision = llm_decision_response
             action_result_message = f"LLM Decision: {decision.action}. Reason: {decision.reason}"
             trade_executed = False
-            
             current_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
             if decision.action == "BUY":
                 if decision.amount_usdt_to_spend > 0:
-                    # For executing a buy, we need the current price.
-                    # The LLM might have fetched it, but it could be slightly stale.
-                    # For simulation, we could assume the LLM provides the price it used,
-                    # or the agent re-fetches. Let's assume re-fetching for accuracy.
                     ticker_data = self.binance_data_tool.get_ticker_price(symbol="BTCUSDT")
                     if "error" not in ticker_data:
                         current_btc_price = float(ticker_data["price"])
@@ -226,24 +223,21 @@ Always use your tools to get the latest market data before making a decision.
             elif decision.action == "HOLD":
                 action_result_message += "\nHolding position. No trade executed."
 
-            # Yield a final agent response summarizing the action taken
             final_balances = self.trading_account.get_balance()
             action_result_message += f"\nFinal Balances: USDT: {final_balances['usdt_balance']:.2f}, BTC: {final_balances['btc_balance']:.8f}"
             
             yield BaseAgentResponse(
-                response_type="agent_action_summary", # Custom type to indicate agent's action summary
+                response_type="agent_action_summary",
                 response_data={
                     "llm_decision": decision.model_dump(),
                     "action_result": action_result_message,
                     "trade_executed": trade_executed,
                     "final_balances": final_balances
                 },
-                raw_request=request, # The initial request that triggered this run
-                raw_response=llm_decision_response # The raw LLM decision object
+                raw_request=request,
+                raw_response=llm_decision_response
             )
         else:
-            # This case occurs if the LLM flow completed without a parsable TradingDecision
-            # (e.g., if max_steps reached, or LLM failed to output JSON after retries)
             yield BaseAgentResponse(
                 response_type="agent_error",
                 response_data={"error": "LLM did not produce a final TradingDecision."},
@@ -251,23 +245,15 @@ Always use your tools to get the latest market data before making a decision.
                 raw_response=None 
             )
 
-    # To make the dynamic instruction formatting more robust within LlmAgent's flow,
-    # one would typically use `before_llm_request_callback` or override `_create_llm_request`.
-    # For example:
-    #
+    # A more robust way for dynamic instruction formatting using ADK's LlmAgent:
     # def before_llm_request_callback(self, request: LlmRequest) -> LlmRequest:
+    #     """Dynamically formats the instruction with current account balances."""
     #     current_balances = self.trading_account.get_balance()
-    #     # Assuming self.instruction is the template string store elsewhere or the initial one
-    #     base_instruction = super().instruction # Or load template
-    #     request.instruction = base_instruction.format(
-    #         usdt_balance=current_balances["usdt_balance"],
-    #         btc_balance=current_balances["btc_balance"]
+    #     # Ensure self._original_instruction holds the template with placeholders
+    #     request.instruction = self._original_instruction.format(
+    #         usdt_balance=f"{current_balances['usdt_balance']:.2f}",
+    #         btc_balance=f"{current_balances['btc_balance']:.8f}"
     #     )
     #     return request
-
-    # However, for this subtask, the _run_async_impl override demonstrates the intent.
-    # The LlmAgent's instruction is typically set at init. Modifying it per-run
-    # as done above is a simplification. A callback is cleaner.
-    # Let's assume the LlmAgent will pick up the modified `self.instruction` for now.
 
 ```
