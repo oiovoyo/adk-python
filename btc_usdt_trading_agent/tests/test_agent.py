@@ -3,54 +3,42 @@ import pytest_asyncio
 import datetime
 from unittest.mock import AsyncMock, MagicMock, patch 
 
-from google_adk.agents import InvocationContext, RunConfig, Event, Part, Content, FunctionCall
+from google_adk.agents import InvocationContext, RunConfig, Event, Part, Content, FunctionCall, LlmRequest, LlmAgent
 from google_adk.sessions import Session 
 
 from btc_usdt_trading_agent.account.trading_account import TradingAccount
 from btc_usdt_trading_agent.agent import TradingAgent, TradingDecision
 from btc_usdt_trading_agent.tools.binance_data_tool import BinanceDataTool
-from btc_usdt_trading_agent.tools import news_fetch_tool # To mock get_crypto_news
+from btc_usdt_trading_agent.tools import news_fetch_tool
 
 TEST_SYMBOL = "BTCUSDT"
 FEE = TradingAccount.FEE_PERCENTAGE
-AGENT_MODULE_PATH = "btc_usdt_trading_agent.agent" # For patching imported functions
+AGENT_MODULE_PATH = "btc_usdt_trading_agent.agent" 
 
 @pytest.fixture
 def trading_account():
-    """Fixture for a TradingAccount instance with 1000 USDT initial balance."""
     return TradingAccount(initial_usdt_balance=1000.0)
 
 @pytest.fixture
-def trading_agent_instance(trading_account: TradingAccount): # Renamed to avoid conflict with class
-    """Fixture for a TradingAgent instance."""
+def trading_agent_instance(trading_account: TradingAccount):
     return TradingAgent(trading_account=trading_account)
 
 @pytest.fixture
-def mock_invocation_context(trading_agent_instance: TradingAgent): # Updated to use renamed fixture
-    """Fixture for a mock InvocationContext."""
+def mock_invocation_context(trading_agent_instance: TradingAgent):
     mock_session = Session(app_name="test_app", user_id="test_user", id="test_session")
-    ctx = InvocationContext(
-        invocation_id="test_inv_id",
-        agent=trading_agent_instance, 
-        session=mock_session,
-        run_config=RunConfig()
-    )
-    return ctx
+    # The agent's instruction will be formatted within the test or helper
+    # based on _original_instruction, so initial LlmRequest can have a placeholder.
+    return LlmRequest(instruction="Initial request instruction placeholder")
 
-async def get_agent_events(agent: TradingAgent, request: Any = None) -> list[Event]:
-    """Helper to collect all events from an agent run."""
+
+async def get_agent_events(agent: TradingAgent, request: LlmRequest) -> list[Event]:
     events = []
-    # Ensure the request object has an instruction field if agent.instruction is not directly used by run_async
-    # For LlmAgent, the instruction in the request can override self.instruction
-    llm_request = request if isinstance(request, LlmRequest) else LlmRequest(instruction=agent.instruction)
-    
-    async for event in agent.run_async(request=llm_request): 
+    async for event in agent.run_async(request=request): 
         events.append(event)
     return events
 
 @pytest_asyncio.fixture
 async def mock_binance_tool_methods_on_agent(trading_agent_instance: TradingAgent, monkeypatch):
-    """Mocks methods of the BinanceDataTool instance within the agent."""
     mock_ticker = MagicMock(return_value={"symbol": TEST_SYMBOL, "price": "60000.00"})
     mock_klines = MagicMock(return_value={"symbol": TEST_SYMBOL, "klines": [{"open_time": "t1", "close": "c1"}]})
     
@@ -59,179 +47,137 @@ async def mock_binance_tool_methods_on_agent(trading_agent_instance: TradingAgen
     return mock_ticker, mock_klines
 
 
-def test_agent_can_be_configured_with_news_tool(trading_agent_instance: TradingAgent):
-    """Verify that get_cryptocurrency_news is one of the agent's tools and instruction is updated."""
-    assert len(trading_agent_instance.tools) == 3
-    news_tool_registered = any(
-        tool.name == "get_cryptocurrency_news" for tool in trading_agent_instance.tools
-    )
-    assert news_tool_registered, "News tool not found in agent's tools list."
+def test_agent_tool_configuration(trading_agent_instance: TradingAgent):
+    """Verify all five tools are correctly configured and instruction is updated."""
+    assert len(trading_agent_instance.tools) == 5
+    
+    expected_tools = {
+        "get_ticker_price": trading_agent_instance.binance_data_tool.get_ticker_price,
+        "get_candlestick_data": trading_agent_instance.binance_data_tool.get_candlestick_data,
+        "get_cryptocurrency_news": news_fetch_tool.get_crypto_news,
+        "get_current_account_position": trading_agent_instance._get_current_account_position,
+        "get_recent_trade_history": trading_agent_instance._get_recent_trade_history,
+    }
 
-    # Check if the function itself is correctly assigned to the tool
-    news_function_tool = next(
-        tool for tool in trading_agent_instance.tools if tool.name == "get_cryptocurrency_news"
-    )
-    assert news_function_tool.func == news_fetch_tool.get_crypto_news
+    for tool_name, tool_func in expected_tools.items():
+        registered_tool = next((t for t in trading_agent_instance.tools if t.name == tool_name), None)
+        assert registered_tool is not None, f"{tool_name} not found in agent's tools list."
+        assert registered_tool.func == tool_func, f"Function for {tool_name} does not match."
 
-    # Check the instruction template stored in the agent
-    assert "get_cryptocurrency_news" in trading_agent_instance._original_instruction
-    assert "news articles" in trading_agent_instance._original_instruction
+    instruction = trading_agent_instance._original_instruction
+    assert "get_current_account_position()" in instruction
+    assert "get_recent_trade_history(num_trades: int = 5)" in instruction
+    assert "get_cryptocurrency_news" in instruction
+    assert "get_ticker_price" in instruction
+    assert "get_candlestick_data" in instruction
+    assert "{usdt_balance}" not in instruction # Placeholder should be removed
+    assert "{btc_balance}" not in instruction  # Placeholder should be removed
+    assert "Before making any trading decision, you should first understand your current financial position" in instruction
 
 
 @pytest.mark.asyncio
-async def test_agent_llm_uses_news_tool_then_holds(
+async def test_agent_llm_uses_account_tools_then_buys(
     trading_agent_instance: TradingAgent, 
     trading_account: TradingAccount, 
-    mock_invocation_context: InvocationContext, # Use the fixture
+    mock_invocation_context: LlmRequest, # Use LlmRequest directly
     monkeypatch,
-    mock_binance_tool_methods_on_agent # Ensure other tools are also benignly mocked
+    mock_binance_tool_methods_on_agent 
 ):
-    """
-    Test a scenario where the LLM first calls the news tool, then makes a HOLD decision.
-    This tests the multi-turn tool use flow.
-    """
     initial_usdt = trading_account.usdt_balance
     initial_btc = trading_account.btc_balance
-    news_query = "bitcoin positive sentiment"
+    num_trades_history_req = 2
+    buy_usdt_amount = 150.0
+    btc_price_for_trade = 61000.0
 
-    # 1. Mock the `get_crypto_news` function itself (which is wrapped by the FunctionTool)
-    mock_news_results = {"query": news_query, "news_items": [{"title": "BTC News", "snippet": "BTC is great", "source_url": "http://news.com/btc"}]}
-    # Patch the function in the module where the agent imports it from
-    mocked_news_func_on_module = AsyncMock(return_value=mock_news_results)
-    monkeypatch.setattr(f"{AGENT_MODULE_PATH}.get_crypto_news", mocked_news_func_on_module)
+    # Mock the price fetch that happens *before* trade execution
+    mock_ticker_exec, _ = mock_binance_tool_methods_on_agent
+    mock_ticker_exec.return_value = {"symbol": TEST_SYMBOL, "price": str(btc_price_for_trade)}
+
+    # --- Simulate LLM's multi-turn interaction by mocking super()._run_async_impl's event stream ---
     
-    # 2. Mock the LlmAgent's `_run_llm_with_tools_async` to simulate multi-turn conversation
-    # This mock will control the sequence of events yielded by the LLM part of the agent.
-    
-    # First LLM response: request to call the news tool
-    news_tool_call = FunctionCall(name="get_cryptocurrency_news", args={"query": news_query})
-    llm_response_event_1_tool_call = Event(
-        event_type="llm_response",
-        data=Content(parts=[Part(function_call=news_tool_call)]),
-        response_type="llm_response", # LlmAgent yields this after LLM call
-        response_data=Content(parts=[Part(function_call=news_tool_call)]) # Parsed content
+    # 1. LLM requests to call get_current_account_position
+    pos_tool_call = FunctionCall(name="get_current_account_position", args={})
+    llm_event_1_pos_call = Event(
+        event_type="llm_response", data=Content(parts=[Part(function_call=pos_tool_call)]),
+        response_type="llm_response", response_data=Content(parts=[Part(function_call=pos_tool_call)])
+    )
+    # Result of this tool call (will be generated by actual agent method)
+    account_pos_result = trading_account.get_balance() 
+    tool_event_1_pos_result = Event(
+        event_type="tool_code_execution_result", data=Content(parts=[Part(text=str(account_pos_result))]),
+        response_type="tool_code_execution_result", response_data=account_pos_result
     )
 
-    # Second LLM response (after tool result): final HOLD decision
-    hold_decision = TradingDecision(
-        action="HOLD", 
-        amount_usdt_to_spend=0.0, 
+    # 2. LLM requests to call get_recent_trade_history
+    hist_tool_call = FunctionCall(name="get_recent_trade_history", args={"num_trades": num_trades_history_req})
+    llm_event_2_hist_call = Event(
+        event_type="llm_response", data=Content(parts=[Part(function_call=hist_tool_call)]),
+        response_type="llm_response", response_data=Content(parts=[Part(function_call=hist_tool_call)])
+    )
+    # Result of this tool call
+    # Manually add a dummy transaction to history for this test
+    trading_account.record_transaction(datetime.datetime.now(datetime.timezone.utc).isoformat(), "BUY", "BTCUSDT", 0.001, 50000, 50, "dummy tx for history", 0.05)
+    history_result = trading_agent_instance._get_recent_trade_history(num_trades=num_trades_history_req)
+    tool_event_2_hist_result = Event(
+        event_type="tool_code_execution_result", data=Content(parts=[Part(text=str(history_result))]),
+        response_type="tool_code_execution_result", response_data=history_result
+    )
+    
+    # 3. LLM makes final BUY decision
+    buy_decision = TradingDecision(
+        action="BUY", 
+        amount_usdt_to_spend=buy_usdt_amount, 
         amount_btc_to_sell=0.0, 
-        reason="Holding after reviewing positive Bitcoin news and stable market data."
+        reason="Analyzed account (has USDT) and history (no recent buys), market looks good."
     )
-    llm_response_event_2_final_decision = Event(
-        event_type="llm_response",
-        data=Content(parts=[Part(text=hold_decision.model_dump_json())]), # LLM outputs JSON text
-        response_type="llm_response",
-        response_data=hold_decision # Agent's _run_async_impl expects this to be TradingDecision
+    llm_event_3_final_decision = Event(
+        event_type="llm_response", data=Content(parts=[Part(text=buy_decision.model_dump_json())]),
+        response_type="llm_response", response_data=buy_decision
     )
 
-    # Configure the mock for _run_llm_with_tools_async
-    mock_llm_flow = AsyncMock()
-    # Simulate two calls to the LLM:
-    # 1st call: LLM decides to use the news tool.
-    # 2nd call (after tool result is processed by LlmAgent): LLM makes final HOLD decision.
-    # The LlmAgent's `_run_async_impl` calls `_run_llm_with_tools_async` in a loop.
-    # We need it to yield the tool call first, then the final decision.
-    # The actual tool call processing is handled by LlmAgent's `_process_tool_calls_async`.
-    
-    # We are mocking `_run_llm_with_tools_async` which is called by `super()._run_async_impl`
-    # The `super()._run_async_impl` itself has the loop for tool use.
-    # So, mocking `super()._run_async_impl` to control the *entire* event stream is better.
-
+    # This async generator simulates the event stream from super()._run_async_impl
     async def mock_super_run_flow(*args, **kwargs):
-        # 1. LLM requests to call the news tool
-        yield llm_response_event_1_tool_call
-        
-        # 2. Agent (LlmAgent part) processes tool call and yields FunctionCallEvent
-        # This part is implicitly handled by the actual LlmAgent if we let it run.
-        # For this test, we need to ensure our mocked get_crypto_news is called.
-        # The LlmAgent will execute the tool.
-        
-        # 3. LlmAgent then yields the FunctionToolResultEvent
-        # We need to create this event as if the tool (our mocked get_crypto_news) ran.
-        tool_result_content = Content(parts=[Part(text=str(mock_news_results))]) # Tool output usually stringified
-        yield Event(
-            event_type="tool_code_execution_result", 
-            data=tool_result_content, # Or directly the result dict
-            response_type="tool_code_execution_result",
-            response_data=mock_news_results # The actual result from the tool
-        )
-        
-        # 4. LLM makes final decision after seeing tool results
-        yield llm_response_event_2_final_decision
+        yield llm_event_1_pos_call
+        yield tool_event_1_pos_result # LlmAgent itself would create this after executing the tool
+        yield llm_event_2_hist_call
+        yield tool_event_2_hist_result # LlmAgent creates this too
+        yield llm_event_3_final_decision
 
-    # Patch the method within the superclass that LlmAgent's _run_async_impl calls.
-    # This is tricky because _run_async_impl calls other internal methods.
-    # Let's simplify: patch `_run_llm_with_tools_async` and assume it's called twice.
-    mock_llm_tool_flow_mock = AsyncMock(side_effect=[
-        # First call to LLM -> requests tool
-        [llm_response_event_1_tool_call], 
-        # Second call to LLM (after tool result) -> final decision
-        [llm_response_event_2_final_decision]  
-    ])
-    # This needs to be an async generator.
-    async def multi_turn_llm_mock(*args, **kwargs):
-        yield llm_response_event_1_tool_call
-        # LlmAgent processes this, calls the tool (our mocked_news_func_on_module)
-        # Then LlmAgent calls LLM again with tool results.
-        # The *next* call to _run_llm_with_tools_async should yield the final decision.
-        # This still requires knowing how many times _run_llm_with_tools_async is called.
-        
-    # A more direct way to test the tool use is to ensure the FunctionTool's func is called.
-    # The LlmAgent's `_process_tool_calls_async` would call our mocked_news_func_on_module.
-    # The final LLM decision (HOLD) would be a separate mock.
+    # Patch the LlmAgent's _run_async_impl which is called by agent's super()._run_async_impl
+    # This mock controls the entire event stream seen by the agent's main processing loop.
+    monkeypatch.setattr(LlmAgent, "_run_async_impl", mock_super_run_flow)
+    
+    # Prepare the initial request for the agent (instruction is now static)
+    llm_request = LlmRequest(instruction=trading_agent_instance._original_instruction)
+    events = await get_agent_events(trading_agent_instance, request=llm_request)
+    
+    # Assertions
+    expected_fee = buy_usdt_amount * FEE
+    expected_btc_bought = buy_usdt_amount / btc_price_for_trade
+    
+    assert trading_account.usdt_balance == pytest.approx(initial_usdt - buy_usdt_amount - expected_fee)
+    assert trading_account.btc_balance == pytest.approx(initial_btc + expected_btc_bought) # initial_btc was 0
+    assert len(trading_account.transaction_history) == 2 # 1 dummy + 1 new BUY
 
-    # Let's use the approach of mocking `super()._run_async_impl` to control the *full* event stream
-    # that our agent's `_run_async_impl` consumes.
-    @patch.object(LlmAgent, '_run_async_impl', new_callable=AsyncMock) # Patch on the LlmAgent class
-    async def run_test_with_patched_super(mock_super_run_impl_method):
-        mock_super_run_impl_method.return_value.__aiter__.return_value = mock_super_run_flow()
-        
-        # Prepare the initial request for the agent
-        current_balances = trading_agent_instance.trading_account.get_balance()
-        formatted_instruction = trading_agent_instance._original_instruction.format(
-            usdt_balance=f"{current_balances['usdt_balance']:.2f}",
-            btc_balance=f"{current_balances['btc_balance']:.8f}"
-        )
-        llm_request = LlmRequest(instruction=formatted_instruction)
+    buy_tx = trading_account.transaction_history[-1] # The BUY transaction
+    assert buy_tx["type"] == "BUY"
+    assert buy_tx["amount_crypto"] == pytest.approx(expected_btc_bought)
+    assert buy_tx["reason"] == "Analyzed account (has USDT) and history (no recent buys), market looks good."
 
+    summary_event = events[-1]
+    assert summary_event.response_type == "agent_action_summary"
+    assert summary_event.response_data["llm_decision"]["action"] == "BUY"
+    assert summary_event.response_data["trade_executed"] is True
+    assert "Buy order executed successfully" in summary_event.response_data["action_result"]
 
-        events = await get_agent_events(trading_agent_instance, request=llm_request)
-        
-        # Assertions
-        mocked_news_func_on_module.assert_called_once_with(query=news_query, num_results=3) # Default num_results
-        
-        assert trading_account.usdt_balance == initial_usdt
-        assert trading_account.btc_balance == initial_btc
-        assert len(trading_account.transaction_history) == 0 
-
-        # Check for the agent_action_summary
-        summary_event = events[-1]
-        assert summary_event.response_type == "agent_action_summary"
-        assert summary_event.response_data["llm_decision"]["action"] == "HOLD"
-        assert "Holding after reviewing positive Bitcoin news" in summary_event.response_data["llm_decision"]["reason"]
-        assert summary_event.response_data["trade_executed"] is False
-        
-        # Check for earlier events if needed (optional here)
-        # print(f"Events: {[e.event_type for e in events]}") # Debugging
-        # Example: find the tool call event if LlmAgent yields it explicitly
-        # function_call_event = next((e for e in events if e.event_type == "function_call" and e.data.name == "get_cryptocurrency_news"), None)
-        # assert function_call_event is not None 
-        # tool_result_event = next((e for e in events if e.event_type == "function_tool_result" and "BTC is great" in str(e.data)), None)
-        # assert tool_result_event is not None
-
-    await run_test_with_patched_super()
-
-
-# Keep other tests from previous steps (BUY, SELL, HOLD direct, errors)
-# These tests from previous subtask (test_agent.py for TradingAgent before news tool) are adapted:
+# --- Existing tests adapted for the new instruction mechanism (static instruction) ---
+# (The mocking of LlmAgent._run_async_impl for direct decisions is still valid)
 
 @pytest.mark.asyncio
 async def test_agent_buy_decision_successful_direct_llm(
     trading_agent_instance: TradingAgent, 
     trading_account: TradingAccount, 
-    mock_invocation_context: InvocationContext,
+    mock_invocation_context: LlmRequest, # Use LlmRequest
     monkeypatch,
     mock_binance_tool_methods_on_agent 
 ):
@@ -242,26 +188,13 @@ async def test_agent_buy_decision_successful_direct_llm(
     mock_ticker_price_execution, _ = mock_binance_tool_methods_on_agent
     mock_ticker_price_execution.return_value = {"symbol": TEST_SYMBOL, "price": str(btc_price_for_trade)}
 
-    buy_decision = TradingDecision(
-        action="BUY", 
-        amount_usdt_to_spend=buy_usdt_amount, 
-        amount_btc_to_sell=0.0, 
-        reason="Test buy reason"
-    )
+    buy_decision = TradingDecision(action="BUY", amount_usdt_to_spend=buy_usdt_amount, reason="Test buy direct")
     
     async def mock_super_run_impl_direct_decision(*args, **kwargs):
-        # Simulate LLM making a decision (final event after any tool use)
         yield Event(event_type="llm_response", data=Content(parts=[Part(text=buy_decision.model_dump_json())]), response_type="llm_response", response_data=buy_decision)
-
     monkeypatch.setattr(LlmAgent, "_run_async_impl", mock_super_run_impl_direct_decision)
 
-
-    current_balances = trading_agent_instance.trading_account.get_balance()
-    formatted_instruction = trading_agent_instance._original_instruction.format(
-        usdt_balance=f"{current_balances['usdt_balance']:.2f}",
-        btc_balance=f"{current_balances['btc_balance']:.8f}"
-    )
-    llm_request = LlmRequest(instruction=formatted_instruction)
+    llm_request = LlmRequest(instruction=trading_agent_instance._original_instruction)
     events = await get_agent_events(trading_agent_instance, request=llm_request) 
 
     expected_fee = buy_usdt_amount * FEE
@@ -274,12 +207,11 @@ async def test_agent_buy_decision_successful_direct_llm(
     assert summary_event.response_type == "agent_action_summary"
     assert summary_event.response_data["llm_decision"]["action"] == "BUY"
 
-
 @pytest.mark.asyncio
 async def test_agent_sell_decision_successful_direct_llm(
     trading_agent_instance: TradingAgent, 
     trading_account: TradingAccount, 
-    mock_invocation_context: InvocationContext,
+    mock_invocation_context: LlmRequest,
     monkeypatch,
     mock_binance_tool_methods_on_agent
 ):
@@ -293,18 +225,13 @@ async def test_agent_sell_decision_successful_direct_llm(
     mock_ticker_price_execution, _ = mock_binance_tool_methods_on_agent
     mock_ticker_price_execution.return_value = {"symbol": TEST_SYMBOL, "price": str(btc_price_for_trade)}
 
-    sell_decision = TradingDecision(action="SELL", amount_usdt_to_spend=0.0, amount_btc_to_sell=sell_btc_amount, reason="Test sell reason")
+    sell_decision = TradingDecision(action="SELL", amount_btc_to_sell=sell_btc_amount, reason="Test sell direct")
     
     async def mock_super_run_impl_direct_decision(*args, **kwargs):
         yield Event(event_type="llm_response", data=Content(parts=[Part(text=sell_decision.model_dump_json())]), response_type="llm_response", response_data=sell_decision)
     monkeypatch.setattr(LlmAgent, "_run_async_impl", mock_super_run_impl_direct_decision)
 
-    current_balances = trading_agent_instance.trading_account.get_balance()
-    formatted_instruction = trading_agent_instance._original_instruction.format(
-        usdt_balance=f"{current_balances['usdt_balance']:.2f}",
-        btc_balance=f"{current_balances['btc_balance']:.8f}"
-    )
-    llm_request = LlmRequest(instruction=formatted_instruction)
+    llm_request = LlmRequest(instruction=trading_agent_instance._original_instruction)
     events = await get_agent_events(trading_agent_instance, request=llm_request)
 
     expected_usdt_value = sell_btc_amount * btc_price_for_trade
@@ -321,23 +248,18 @@ async def test_agent_sell_decision_successful_direct_llm(
 async def test_agent_hold_decision_direct_llm(
     trading_agent_instance: TradingAgent, 
     trading_account: TradingAccount, 
-    mock_invocation_context: InvocationContext,
+    mock_invocation_context: LlmRequest,
     monkeypatch
 ):
     initial_usdt = trading_account.usdt_balance
     initial_btc = trading_account.btc_balance
-    hold_decision = TradingDecision(action="HOLD", reason="Market unclear")
+    hold_decision = TradingDecision(action="HOLD", reason="Market unclear direct")
 
     async def mock_super_run_impl_direct_decision(*args, **kwargs):
         yield Event(event_type="llm_response", data=Content(parts=[Part(text=hold_decision.model_dump_json())]), response_type="llm_response", response_data=hold_decision)
     monkeypatch.setattr(LlmAgent, "_run_async_impl", mock_super_run_impl_direct_decision)
 
-    current_balances = trading_agent_instance.trading_account.get_balance()
-    formatted_instruction = trading_agent_instance._original_instruction.format(
-        usdt_balance=f"{current_balances['usdt_balance']:.2f}",
-        btc_balance=f"{current_balances['btc_balance']:.8f}"
-    )
-    llm_request = LlmRequest(instruction=formatted_instruction)
+    llm_request = LlmRequest(instruction=trading_agent_instance._original_instruction)
     events = await get_agent_events(trading_agent_instance, request=llm_request)
 
     assert trading_account.usdt_balance == initial_usdt
@@ -349,22 +271,16 @@ async def test_agent_hold_decision_direct_llm(
 @pytest.mark.asyncio
 async def test_agent_llm_invalid_decision_format_direct_llm(
     trading_agent_instance: TradingAgent, 
-    mock_invocation_context: InvocationContext,
+    mock_invocation_context: LlmRequest,
     monkeypatch
 ):
     invalid_llm_output_dict = {"action": "BUY", "amount_usdt_to_spend": "a lot", "reason": 123}
 
     async def mock_super_run_impl_invalid_data(*args, **kwargs):
-        # Simulate LlmAgent yielding raw dict that fails Pydantic parsing in TradingAgent's _run_async_impl
         yield Event(event_type="llm_response", data=invalid_llm_output_dict, response_type="llm_response", response_data=invalid_llm_output_dict)
     monkeypatch.setattr(LlmAgent, "_run_async_impl", mock_super_run_impl_invalid_data)
     
-    current_balances = trading_agent_instance.trading_account.get_balance()
-    formatted_instruction = trading_agent_instance._original_instruction.format(
-        usdt_balance=f"{current_balances['usdt_balance']:.2f}",
-        btc_balance=f"{current_balances['btc_balance']:.8f}"
-    )
-    llm_request = LlmRequest(instruction=formatted_instruction)
+    llm_request = LlmRequest(instruction=trading_agent_instance._original_instruction)
     events = await get_agent_events(trading_agent_instance, request=llm_request)
 
     error_event = events[-1] 
@@ -375,7 +291,7 @@ async def test_agent_llm_invalid_decision_format_direct_llm(
 async def test_agent_trade_execution_price_fetch_fails_direct_llm(
     trading_agent_instance: TradingAgent, 
     trading_account: TradingAccount, 
-    mock_invocation_context: InvocationContext,
+    mock_invocation_context: LlmRequest,
     monkeypatch,
     mock_binance_tool_methods_on_agent
 ):
@@ -388,12 +304,7 @@ async def test_agent_trade_execution_price_fetch_fails_direct_llm(
     mock_ticker_price_execution, _ = mock_binance_tool_methods_on_agent
     mock_ticker_price_execution.return_value = {"error": "API is down"}
 
-    current_balances = trading_agent_instance.trading_account.get_balance()
-    formatted_instruction = trading_agent_instance._original_instruction.format(
-        usdt_balance=f"{current_balances['usdt_balance']:.2f}",
-        btc_balance=f"{current_balances['btc_balance']:.8f}"
-    )
-    llm_request = LlmRequest(instruction=formatted_instruction)
+    llm_request = LlmRequest(instruction=trading_agent_instance._original_instruction)
     events = await get_agent_events(trading_agent_instance, request=llm_request)
 
     summary_event = events[-1]
@@ -401,4 +312,6 @@ async def test_agent_trade_execution_price_fetch_fails_direct_llm(
     assert summary_event.response_data["trade_executed"] is False
     assert "Could not execute BUY: Failed to fetch current price - API is down" in summary_event.response_data["action_result"]
 
+# Removed the previous test_agent_llm_uses_news_tool_then_holds as it's superseded by more general tool use tests.
+# The configuration test is expanded, and the new multi-tool test covers account tools.
 ```

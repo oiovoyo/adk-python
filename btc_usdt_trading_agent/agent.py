@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 
 from btc_usdt_trading_agent.tools.binance_data_tool import BinanceDataTool
 from btc_usdt_trading_agent.account.trading_account import TradingAccount
-from btc_usdt_trading_agent.tools.news_fetch_tool import get_crypto_news # Import the new tool
+from btc_usdt_trading_agent.tools.news_fetch_tool import get_crypto_news
 
 
 class TradingDecision(BaseModel):
@@ -59,27 +59,36 @@ class TradingAgent(LlmAgent[TradingDecision, BaseAgentResponse[TradingDecision]]
                 name="get_candlestick_data",
                 description="Fetches recent candlestick (k-line) data for a cryptocurrency symbol from Binance. Example: {\"symbol\": \"BTCUSDT\", \"interval\": \"1h\", \"limit\": 24}"
             ),
-            FunctionTool( # New NewsFetchTool
-                func=get_crypto_news, # Directly use the imported async function
+            FunctionTool( 
+                func=get_crypto_news, 
                 name="get_cryptocurrency_news",
                 description="Fetches recent news articles related to a specific cryptocurrency or market trend. Use queries like 'bitcoin price sentiment', 'ethereum new projects', or 'overall crypto market trends'. Example: {\"query\": \"bitcoin price sentiment\", \"num_results\": 3}"
+            ),
+            FunctionTool( # New Account Position Tool
+                func=self._get_current_account_position,
+                name="get_current_account_position",
+                description="Fetches the current balances of USDT and BTC in your trading account."
+            ),
+            FunctionTool( # New Trade History Tool
+                func=self._get_recent_trade_history,
+                name="get_recent_trade_history",
+                description="Fetches the last N simulated trade transactions. You can specify N (e.g., num_trades=5)."
             )
         ]
 
-        # Store the instruction template. It will be formatted dynamically.
         self._original_instruction = """\
 You are a cryptocurrency trading analyst. Your goal is to maximize the USDT value of a simulated trading account.
 
-Current Account Balance:
-USDT: {usdt_balance}
-BTC: {btc_balance}
+Before making any trading decision, you should first understand your current financial position and recent trading activity. Use these tools:
+1. `get_current_account_position()`: Fetches your current USDT and BTC balances.
+2. `get_recent_trade_history(num_trades: int = 5)`: Fetches your last N trades.
 
-You have access to the following tools to gather market data:
-1. `get_ticker_price(symbol: str)`: Fetches the latest price for a cryptocurrency symbol.
-2. `get_candlestick_data(symbol: str, interval: str = '1h', limit: int = 24)`: Fetches recent candlestick (k-line) data.
-3. `get_cryptocurrency_news(query: str, num_results: int = 3)`: Fetches recent news articles. Use this to understand market sentiment or find news that might impact prices (e.g., query 'bitcoin price sentiment' or 'ethereum new regulations').
+Then, analyze the market using:
+3. `get_ticker_price(symbol: str)`: Fetches the latest price for a cryptocurrency symbol.
+4. `get_candlestick_data(symbol: str, interval: str = '1h', limit: int = 24)`: Fetches recent candlestick (k-line) data.
+5. `get_cryptocurrency_news(query: str, num_results: int = 3)`: Fetches recent news articles. Use this to understand market sentiment or find news that might impact prices (e.g., query 'bitcoin price sentiment' or 'ethereum new regulations').
 
-Based on your analysis of all available data (ticker price, candlestick patterns, and relevant news), you must decide whether to BUY BTC, SELL BTC, or HOLD.
+Based on your analysis of all available data (your current position, past trades, ticker price, candlestick patterns, and relevant news), you must decide whether to BUY BTC, SELL BTC, or HOLD.
 
 Decision Guidelines:
 1.  If you decide to BUY BTC:
@@ -95,7 +104,7 @@ Decision Guidelines:
     *   This is appropriate if no clear opportunity is present or the market is too volatile without clear direction.
 
 Reasoning:
-You MUST provide a clear and concise reason for your decision, based on your analysis of the market data (candlestick patterns, trends, support/resistance levels, significant price movements, and news sentiment).
+You MUST provide a clear and concise reason for your decision, based on your analysis of all available data.
 
 Output Format:
 Your final decision MUST be structured as a JSON object conforming to the following schema:
@@ -107,16 +116,14 @@ Your final decision MUST be structured as a JSON object conforming to the follow
 }}
 
 Example Decisions:
-- Buying: {{"action": "BUY", "amount_usdt_to_spend": 200.0, "amount_btc_to_sell": 0.0, "reason": "Price bounced off support at 60000, RSI is oversold, and recent positive news about Bitcoin adoption suggests upward potential."}}
-- Selling: {{"action": "SELL", "amount_usdt_to_spend": 0.0, "amount_btc_to_sell": 0.01, "reason": "Bearish engulfing pattern on 1h chart at resistance 65000, coupled with negative regulatory news."}}
-- Holding: {{"action": "HOLD", "amount_usdt_to_spend": 0.0, "amount_btc_to_sell": 0.0, "reason": "Market is consolidating (61000-62000), news is mixed, awaiting clearer signal."}}
+- Buying: {{"action": "BUY", "amount_usdt_to_spend": 200.0, "amount_btc_to_sell": 0.0, "reason": "Account has 1000 USDT. Bitcoin price is at support 60000, RSI is oversold, and recent positive news about Bitcoin adoption suggests upward potential."}}
+- Selling: {{"action": "SELL", "amount_usdt_to_spend": 0.0, "amount_btc_to_sell": 0.01, "reason": "Account has 0.5 BTC. Bearish engulfing pattern on 1h chart at resistance 65000, coupled with negative regulatory news."}}
+- Holding: {{"action": "HOLD", "amount_usdt_to_spend": 0.0, "amount_btc_to_sell": 0.0, "reason": "Market is consolidating (61000-62000), news is mixed, current BTC holding is minimal, awaiting clearer signal."}}
 
-Always use your tools to get the latest market data before making a decision. Consider all available data (price, candlesticks, news) for a comprehensive analysis.
+Always use your tools to get the latest market data and account status before making a decision.
 """
-        # The instruction passed to super() will be formatted dynamically in _run_async_impl or a callback.
-        # For now, pass the template; LlmAgent expects an instruction string.
         super().__init__(
-            instruction=self._original_instruction, # Will be formatted before each LLM call
+            instruction=self._original_instruction, # This is now the static template
             tools=tools,
             model=model_name,
             output_schema=TradingDecision,
@@ -130,32 +137,17 @@ Always use your tools to get the latest market data before making a decision. Co
     ) -> AsyncGenerator[BaseAgentResponse[TradingDecision], None]:
         """
         Core logic for the TradingAgent.
-        Formats instruction with current balance, lets LLM make a decision, then processes it.
+        The instruction is now static; LLM uses tools to get dynamic info.
         """
-        current_balances = self.trading_account.get_balance()
-        formatted_instruction = self._original_instruction.format(
-            usdt_balance=f"{current_balances['usdt_balance']:.2f}", # Format for readability
-            btc_balance=f"{current_balances['btc_balance']:.8f}"  # Format for readability
-        )
-        
-        # Create a new LlmRequest with the formatted instruction for this specific run.
-        # This is a cleaner way than modifying self.instruction directly.
-        # The LlmAgent's run_async flow should ideally use the instruction from the request object.
-        # We assume that the LlmAgent uses request.instruction if provided,
-        # or falls back to self.instruction. If `request` is directly mutated, it works.
-        # If not, LlmAgent might need a specific way to update instruction per run.
-        
-        # For simplicity in this context, we'll rely on the LlmAgent using its `self.instruction`.
-        # We'll set it for this run and then restore it.
-        # A more robust ADK pattern would use a callback like `before_llm_request_callback`
-        # to modify the instruction in the LlmRequest just before the API call.
-        
-        original_agent_instruction = self.instruction # Save agent's base instruction
-        self.instruction = formatted_instruction     # Set dynamically formatted one for this run
+        # The dynamic instruction formatting block is removed.
+        # self.instruction is already set to self._original_instruction in __init__.
+        # If LlmAgent requires the instruction to be part of the request object for each run,
+        # then the calling code (or a callback like before_llm_request_callback)
+        # would be responsible for populating request.instruction.
+        # For this implementation, we assume LlmAgent uses self.instruction.
 
         llm_decision_response: TradingDecision | None = None
         
-        # The super()._run_async_impl will use the tools and the (now dynamically formatted) self.instruction
         async for event in super()._run_async_impl(request, execution_context):
             yield event
             if event.response_type == "llm_response" and event.response_data:
@@ -173,8 +165,7 @@ Always use your tools to get the latest market data before making a decision. Co
                         )
                         llm_decision_response = None
                         break 
-
-        self.instruction = original_agent_instruction # Restore original instruction template
+        # No need to restore self.instruction as it wasn't changed for this specific run.
 
         if llm_decision_response:
             decision = llm_decision_response
@@ -184,6 +175,7 @@ Always use your tools to get the latest market data before making a decision. Co
 
             if decision.action == "BUY":
                 if decision.amount_usdt_to_spend > 0:
+                    # LLM should have used tools to get price, but for safety in simulation, re-fetch.
                     ticker_data = self.binance_data_tool.get_ticker_price(symbol="BTCUSDT")
                     if "error" not in ticker_data:
                         current_btc_price = float(ticker_data["price"])
@@ -245,15 +237,41 @@ Always use your tools to get the latest market data before making a decision. Co
                 raw_response=None 
             )
 
-    # A more robust way for dynamic instruction formatting using ADK's LlmAgent:
-    # def before_llm_request_callback(self, request: LlmRequest) -> LlmRequest:
-    #     """Dynamically formats the instruction with current account balances."""
-    #     current_balances = self.trading_account.get_balance()
-    #     # Ensure self._original_instruction holds the template with placeholders
-    #     request.instruction = self._original_instruction.format(
-    #         usdt_balance=f"{current_balances['usdt_balance']:.2f}",
-    #         btc_balance=f"{current_balances['btc_balance']:.8f}"
-    #     )
-    #     return request
+    def _get_current_account_position(self) -> dict:
+        """
+        Retrieves the current USDT and BTC balances from the trading account.
+        This method is intended to be wrapped as a FunctionTool.
+        """
+        return self.trading_account.get_balance()
 
+    def _get_recent_trade_history(self, num_trades: int = 5) -> dict:
+        """
+        Retrieves the most recent trades from the transaction history.
+        This method is intended to be wrapped as a FunctionTool.
+
+        Args:
+            num_trades: The maximum number of recent trades to retrieve.
+                        Defaults to 5. If non-positive, no trades are returned.
+
+        Returns:
+            A dictionary containing the list of recent trades and the count.
+        """
+        if num_trades <= 0:
+            history_slice = []
+        else:
+            history_slice = self.trading_account.transaction_history[-num_trades:]
+        
+        return {
+            "trade_history": history_slice,
+            "trades_returned": len(history_slice)
+        }
+
+    # Example of using before_llm_request_callback for dynamic instructions
+    # if self.instruction modification in _run_async_impl is not preferred/supported.
+    # def before_llm_request_callback(self, request: LlmRequest) -> LlmRequest:
+    #     """Dynamically formats the instruction if needed (not used in current setup)."""
+    #     # This would be the place to inject dynamic info into request.instruction
+    #     # if self.instruction passed to super() was a static template not containing balances.
+    #     # However, current _original_instruction is now static and doesn't need balance formatting.
+    #     return request
 ```
