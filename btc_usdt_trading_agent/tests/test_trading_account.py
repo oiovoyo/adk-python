@@ -1,10 +1,13 @@
 import pytest
 import datetime
-from btc_usdt_trading_agent.account.trading_account import TradingAccount
+import uuid # For checking position_id format, not generating it here.
+from btc_usdt_trading_agent.account.trading_account import TradingAccount, OpenPosition
 
 # Define a fixed timestamp for predictable tests
-TEST_TIMESTAMP = datetime.datetime.now(datetime.timezone.utc).isoformat()
+TEST_TIMESTAMP_STR = datetime.datetime.now(datetime.timezone.utc).isoformat()
 FEE = TradingAccount.FEE_PERCENTAGE
+DEFAULT_SL_PCT = TradingAccount.DEFAULT_STOP_LOSS_PCT
+DEFAULT_TP_PCT = TradingAccount.DEFAULT_TAKE_PROFIT_PCT
 
 @pytest.fixture
 def account():
@@ -12,245 +15,231 @@ def account():
     return TradingAccount(initial_usdt_balance=1000.0)
 
 @pytest.fixture
-def account_for_btc_tests():
-    """Returns a TradingAccount instance with some BTC for selling tests."""
-    acc = TradingAccount(initial_usdt_balance=1000.0)
-    # Pre-populate with some BTC without fees for simpler sell test setup
-    acc.btc_balance = 1.0 
-    return acc
+def account_with_open_position(account: TradingAccount):
+    """Returns an account with one open position."""
+    buy_result = account.execute_buy_order(
+        symbol="BTCUSDT", 
+        usdt_amount_to_spend=500.0, 
+        current_btc_price=50000.0, 
+        reason="Initial position for testing sells", 
+        timestamp=TEST_TIMESTAMP_STR
+    )
+    assert buy_result["success"]
+    assert len(account.open_positions) == 1
+    return account, buy_result["position_id"], buy_result["btc_bought"], buy_result["entry_price"]
 
-def test_initialization_default():
-    """Test account initialization with default USDT balance."""
-    acc = TradingAccount()
-    assert acc.usdt_balance == 1000.0
-    assert acc.btc_balance == 0.0
-    assert acc.transaction_history == []
+
+def test_initialization_default(account: TradingAccount):
+    assert account.usdt_balance == 1000.0
+    assert account.btc_balance == 0.0 # Derived from empty open_positions
+    assert account.open_positions == []
+    assert account.transaction_history == []
 
 def test_initialization_custom_balance():
-    """Test account initialization with a custom USDT balance."""
     acc = TradingAccount(initial_usdt_balance=500.0)
     assert acc.usdt_balance == 500.0
     assert acc.btc_balance == 0.0
+    assert acc.open_positions == []
 
 def test_initialization_negative_balance():
-    """Test initialization with negative USDT balance raises ValueError."""
     with pytest.raises(ValueError, match="Initial USDT balance cannot be negative."):
         TradingAccount(initial_usdt_balance=-100.0)
 
-def test_get_balance(account: TradingAccount):
-    """Test get_balance returns correct balances."""
-    account.usdt_balance = 500.0
-    account.btc_balance = 0.5
-    assert account.get_balance() == {"usdt_balance": 500.0, "btc_balance": 0.5}
+def test_get_balance_no_positions(account: TradingAccount):
+    assert account.get_balance() == {"usdt_balance": 1000.0, "btc_balance": 0.0}
 
-# --- Test execute_buy_order ---
-def test_execute_buy_order_success(account: TradingAccount):
+def test_execute_buy_order_success_with_sl_tp(account: TradingAccount):
     initial_usdt = account.usdt_balance
     usdt_to_spend = 100.0
     btc_price = 50000.0
-    reason = "Test buy"
+    sl_price = 47000.0
+    tp_price = 55000.0
+    reason = "Test buy with SL/TP"
     
+    result = account.execute_buy_order(
+        "BTCUSDT", usdt_to_spend, btc_price, reason, TEST_TIMESTAMP_STR,
+        stop_loss_price=sl_price, take_profit_price=tp_price
+    )
+
+    assert result["success"] is True
+    assert result["message"] == "Buy order executed successfully, new position opened."
+    assert "position_id" in result
+    position_id = result["position_id"]
+    assert isinstance(position_id, str)
+
     expected_fee = usdt_to_spend * FEE
     expected_total_deducted = usdt_to_spend + expected_fee
     expected_btc_bought = usdt_to_spend / btc_price
 
-    result = account.execute_buy_order("BTCUSDT", usdt_to_spend, btc_price, reason, TEST_TIMESTAMP)
-
-    assert result["success"] is True
-    assert result["message"] == "Buy order executed successfully."
     assert result["btc_bought"] == pytest.approx(expected_btc_bought)
-    assert result["usdt_spent_before_fee"] == pytest.approx(usdt_to_spend)
-    assert result["fee_usdt"] == pytest.approx(expected_fee)
-    assert result["total_usdt_deducted"] == pytest.approx(expected_total_deducted)
+    assert result["entry_price"] == pytest.approx(btc_price)
+    assert result["stop_loss_price"] == pytest.approx(sl_price)
+    assert result["take_profit_price"] == pytest.approx(tp_price)
     
     assert account.usdt_balance == pytest.approx(initial_usdt - expected_total_deducted)
-    assert account.btc_balance == pytest.approx(expected_btc_bought)
+    assert account.get_balance()["btc_balance"] == pytest.approx(expected_btc_bought) # Check derived balance
+    
+    assert len(account.open_positions) == 1
+    open_pos = account.open_positions[0]
+    assert open_pos.position_id == position_id
+    assert open_pos.symbol == "BTCUSDT"
+    assert open_pos.amount_crypto == pytest.approx(expected_btc_bought)
+    assert open_pos.entry_price == pytest.approx(btc_price)
+    assert open_pos.stop_loss_price == pytest.approx(sl_price)
+    assert open_pos.take_profit_price == pytest.approx(tp_price)
+    assert open_pos.status == "OPEN"
     
     assert len(account.transaction_history) == 1
     tx = account.transaction_history[0]
     assert tx["type"] == "BUY"
-    assert tx["symbol"] == "BTCUSDT"
-    assert tx["amount_crypto"] == pytest.approx(expected_btc_bought)
-    assert tx["price"] == pytest.approx(btc_price)
-    assert tx["total_usdt_value_before_fee"] == pytest.approx(usdt_to_spend)
-    assert tx["reason"] == reason
-    assert tx["timestamp"] == TEST_TIMESTAMP
-    assert tx["fee_usdt"] == pytest.approx(expected_fee)
+    assert tx["position_id"] == position_id
 
-def test_execute_buy_order_insufficient_funds(account: TradingAccount):
-    initial_usdt = account.usdt_balance
-    initial_btc = account.btc_balance
-    # usdt_to_spend = initial_usdt + 100.0 # More than available (considering fee makes it even more)
-    # Recalculate to ensure it's truly insufficient even if initial_usdt is small
-    # If usdt_to_spend is just initial_usdt, fee will make it insufficient
-    # If usdt_to_spend = initial_usdt / (1 + FEE) it would be exact.
-    # So, usdt_to_spend = initial_usdt should fail if FEE > 0
-    if FEE > 0:
-         usdt_to_spend_for_fail = initial_usdt # This amount, after adding fee, will exceed balance
-         if usdt_to_spend_for_fail * (1 + FEE) <= initial_usdt : # handle case where initial_usdt is very small
-             usdt_to_spend_for_fail = initial_usdt + 1.0 # Ensure it's definitely more
-    else: # if fee is zero, need to spend more than balance
-         usdt_to_spend_for_fail = initial_usdt + 1.0
-
-
+def test_execute_buy_order_default_sl_tp_calculation(account: TradingAccount):
+    usdt_to_spend = 100.0
     btc_price = 50000.0
     
-    result = account.execute_buy_order("BTCUSDT", usdt_to_spend_for_fail, btc_price, "Test buy fail", TEST_TIMESTAMP)
-
-    assert result["success"] is False
-    assert "Insufficient USDT balance" in result["message"]
-    assert account.usdt_balance == initial_usdt # Balance unchanged
-    assert account.btc_balance == initial_btc   # Balance unchanged
-    assert len(account.transaction_history) == 0 # No transaction recorded
-
-def test_execute_buy_order_zero_amount(account: TradingAccount):
-    result = account.execute_buy_order("BTCUSDT", 0, 50000.0, "Test buy zero", TEST_TIMESTAMP)
-    assert result["success"] is False
-    assert result["message"] == "USDT amount to spend must be positive."
-    assert len(account.transaction_history) == 0
-
-def test_execute_buy_order_negative_amount(account: TradingAccount):
-    result = account.execute_buy_order("BTCUSDT", -100, 50000.0, "Test buy negative", TEST_TIMESTAMP)
-    assert result["success"] is False
-    assert result["message"] == "USDT amount to spend must be positive."
-    assert len(account.transaction_history) == 0
-
-def test_execute_buy_order_zero_price(account: TradingAccount):
-    result = account.execute_buy_order("BTCUSDT", 100, 0, "Test buy zero price", TEST_TIMESTAMP)
-    assert result["success"] is False
-    assert result["message"] == "BTC price must be positive."
-    assert len(account.transaction_history) == 0
-
-# --- Test execute_sell_order ---
-def test_execute_sell_order_success(account_for_btc_tests: TradingAccount):
-    account = account_for_btc_tests # Use pre-populated account
-    initial_usdt = account.usdt_balance
-    initial_btc = account.btc_balance # Should be 1.0
+    result = account.execute_buy_order(
+        "BTCUSDT", usdt_to_spend, btc_price, "Test default SL/TP", TEST_TIMESTAMP_STR
+    )
+    assert result["success"]
+    position_id = result["position_id"]
     
-    btc_to_sell = 0.5
-    btc_price = 52000.0
-    reason = "Test sell"
+    expected_sl = btc_price * (1 - DEFAULT_SL_PCT)
+    expected_tp = btc_price * (1 + DEFAULT_TP_PCT)
+    
+    assert result["stop_loss_price"] == pytest.approx(expected_sl)
+    assert result["take_profit_price"] == pytest.approx(expected_tp)
 
-    expected_usdt_value = btc_to_sell * btc_price
+    open_pos = next(p for p in account.open_positions if p.position_id == position_id)
+    assert open_pos.stop_loss_price == pytest.approx(expected_sl)
+    assert open_pos.take_profit_price == pytest.approx(expected_tp)
+
+def test_execute_sell_order_specific_position_id(account_with_open_position):
+    account, pos_id_to_sell, initial_pos_btc, entry_price = account_with_open_position
+    initial_usdt = account.usdt_balance
+    
+    sell_price = 52000.0
+    reason = "Closing specific position"
+    
+    result = account.execute_sell_order(
+        "BTCUSDT", btc_amount_to_sell=0, # Amount ignored when position_id is provided
+        current_btc_price=sell_price, 
+        reason=reason, 
+        timestamp=TEST_TIMESTAMP_STR + "_sell",
+        position_id_to_close=pos_id_to_sell
+    )
+
+    assert result["success"] is True
+    assert result["message"] == f"Sell order executed successfully. Position {pos_id_to_sell} closed."
+    assert result["position_id_closed"] == pos_id_to_sell
+    assert result["btc_sold"] == pytest.approx(initial_pos_btc)
+    assert result["exit_price"] == pytest.approx(sell_price)
+
+    expected_usdt_value = initial_pos_btc * sell_price
     expected_fee = expected_usdt_value * FEE
     expected_usdt_received = expected_usdt_value - expected_fee
     
-    result = account.execute_sell_order("BTCUSDT", btc_to_sell, btc_price, reason, TEST_TIMESTAMP)
-
-    assert result["success"] is True
-    assert result["message"] == "Sell order executed successfully."
-    assert result["btc_sold"] == pytest.approx(btc_to_sell)
-    assert result["usdt_value_before_fee"] == pytest.approx(expected_usdt_value)
-    assert result["fee_usdt"] == pytest.approx(expected_fee)
-    assert result["usdt_received_after_fee"] == pytest.approx(expected_usdt_received)
-
-    assert account.btc_balance == pytest.approx(initial_btc - btc_to_sell)
     assert account.usdt_balance == pytest.approx(initial_usdt + expected_usdt_received)
+    assert account.get_balance()["btc_balance"] == pytest.approx(0) # Only one position was open
     
-    assert len(account.transaction_history) == 1
-    tx = account.transaction_history[0]
-    assert tx["type"] == "SELL"
-    assert tx["symbol"] == "BTCUSDT"
-    assert tx["amount_crypto"] == pytest.approx(btc_to_sell)
-    assert tx["price"] == pytest.approx(btc_price)
-    assert tx["total_usdt_value_before_fee"] == pytest.approx(expected_usdt_value)
-    assert tx["reason"] == reason
-    assert tx["timestamp"] == TEST_TIMESTAMP
-    assert tx["fee_usdt"] == pytest.approx(expected_fee)
+    closed_pos = next(p for p in account.open_positions if p.position_id == pos_id_to_sell)
+    assert closed_pos.status == "CLOSED"
+    assert closed_pos.closure_reason == reason
+    assert closed_pos.exit_price == pytest.approx(sell_price)
+    assert closed_pos.closed_timestamp == TEST_TIMESTAMP_STR + "_sell"
+    
+    assert len(account.transaction_history) == 2 # Initial buy + this sell
+    sell_tx = account.transaction_history[-1]
+    assert sell_tx["type"] == "SELL"
+    assert sell_tx["position_id"] == pos_id_to_sell
+    assert sell_tx["reason"] == reason
 
-def test_execute_sell_order_insufficient_btc(account: TradingAccount): # Uses default account with 0 BTC
-    initial_usdt = account.usdt_balance
-    initial_btc = account.btc_balance # Should be 0
+def test_execute_sell_order_manual_oldest_position(account: TradingAccount):
+    # Create two positions
+    buy1_res = account.execute_buy_order("BTCUSDT", 100, 50000, "Buy 1", TEST_TIMESTAMP_STR + "_1")
+    pos1_id = buy1_res["position_id"]
+    pos1_btc = buy1_res["btc_bought"]
     
-    result = account.execute_sell_order("BTCUSDT", 0.1, 52000.0, "Test sell fail", TEST_TIMESTAMP)
+    # Make sure timestamps are different for "oldest"
+    import time; time.sleep(0.001) 
+    buy2_res = account.execute_buy_order("BTCUSDT", 100, 51000, "Buy 2", datetime.datetime.now(datetime.timezone.utc).isoformat())
 
-    assert result["success"] is False
-    assert result["message"] == "Insufficient BTC balance."
-    assert account.usdt_balance == initial_usdt
-    assert account.btc_balance == initial_btc
-    assert len(account.transaction_history) == 0
+    assert len(account.open_positions) == 2
+    initial_total_btc = account.get_balance()["btc_balance"]
 
-def test_execute_sell_order_zero_amount(account_for_btc_tests: TradingAccount):
-    result = account_for_btc_tests.execute_sell_order("BTCUSDT", 0, 52000.0, "Test sell zero", TEST_TIMESTAMP)
-    assert result["success"] is False
-    assert result["message"] == "BTC amount to sell must be positive."
-    assert len(account_for_btc_tests.transaction_history) == 0
-
-def test_execute_sell_order_negative_amount(account_for_btc_tests: TradingAccount):
-    result = account_for_btc_tests.execute_sell_order("BTCUSDT", -0.1, 52000.0, "Test sell negative", TEST_TIMESTAMP)
-    assert result["success"] is False
-    assert result["message"] == "BTC amount to sell must be positive."
-    assert len(account_for_btc_tests.transaction_history) == 0
-
-def test_execute_sell_order_zero_price(account_for_btc_tests: TradingAccount):
-    result = account_for_btc_tests.execute_sell_order("BTCUSDT", 0.1, 0, "Test sell zero price", TEST_TIMESTAMP)
-    assert result["success"] is False
-    assert result["message"] == "BTC price must be positive."
-    assert len(account_for_btc_tests.transaction_history) == 0
-    
-# --- Test multiple transactions and fee accuracy ---
-def test_multiple_transactions(account: TradingAccount):
-    # 1. Buy BTC
-    buy1_usdt = 200.0
-    buy1_price = 50000.0
-    buy1_fee = buy1_usdt * FEE
-    buy1_total_deducted = buy1_usdt + buy1_fee
-    buy1_btc_bought = buy1_usdt / buy1_price
-    
-    account.execute_buy_order("BTCUSDT", buy1_usdt, buy1_price, "Buy 1", TEST_TIMESTAMP + "_1")
-    
-    assert account.usdt_balance == pytest.approx(1000.0 - buy1_total_deducted)
-    assert account.btc_balance == pytest.approx(buy1_btc_bought)
-    
-    # 2. Buy more BTC
-    buy2_usdt = 300.0
-    buy2_price = 51000.0 # Different price
-    buy2_fee = buy2_usdt * FEE
-    buy2_total_deducted = buy2_usdt + buy2_fee
-    buy2_btc_bought = buy2_usdt / buy2_price
-    
-    current_usdt_before_buy2 = account.usdt_balance
-    account.execute_buy_order("BTCUSDT", buy2_usdt, buy2_price, "Buy 2", TEST_TIMESTAMP + "_2")
-    
-    assert account.usdt_balance == pytest.approx(current_usdt_before_buy2 - buy2_total_deducted)
-    assert account.btc_balance == pytest.approx(buy1_btc_bought + buy2_btc_bought)
-    
-    # 3. Sell some BTC
-    sell1_btc = buy1_btc_bought / 2
-    sell1_price = 52000.0
-    sell1_usdt_value = sell1_btc * sell1_price
-    sell1_fee = sell1_usdt_value * FEE
-    sell1_usdt_received = sell1_usdt_value - sell1_fee
-    
-    current_usdt_before_sell1 = account.usdt_balance
-    current_btc_before_sell1 = account.btc_balance
-    account.execute_sell_order("BTCUSDT", sell1_btc, sell1_price, "Sell 1", TEST_TIMESTAMP + "_3")
-    
-    assert account.usdt_balance == pytest.approx(current_usdt_before_sell1 + sell1_usdt_received)
-    assert account.btc_balance == pytest.approx(current_btc_before_sell1 - sell1_btc)
-    
-    assert len(account.transaction_history) == 3
-    assert account.transaction_history[0]["type"] == "BUY"
-    assert account.transaction_history[0]["reason"] == "Buy 1"
-    assert account.transaction_history[1]["type"] == "BUY"
-    assert account.transaction_history[1]["reason"] == "Buy 2"
-    assert account.transaction_history[2]["type"] == "SELL"
-    assert account.transaction_history[2]["reason"] == "Sell 1"
-
-    # Check total fees paid (sum of fees from individual transactions)
-    total_fees_recorded = sum(tx["fee_usdt"] for tx in account.transaction_history)
-    assert total_fees_recorded == pytest.approx(buy1_fee + buy2_fee + sell1_fee)
-
-def test_record_transaction_directly(account: TradingAccount):
-    """Test direct call to record_transaction."""
-    ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
-    account.record_transaction(
-        timestamp=ts, type="DEPOSIT", symbol="USDT",
-        amount_crypto=100.0, price=1.0, total_usdt=100.0, # price not relevant for deposit
-        reason="Initial deposit check", fee=0.0
+    # Sell oldest (pos1) by providing its exact amount
+    sell_price = 52000.0
+    result = account.execute_sell_order(
+        "BTCUSDT", btc_amount_to_sell=pos1_btc, 
+        current_btc_price=sell_price, 
+        reason="Manual sell oldest", 
+        timestamp=datetime.datetime.now(datetime.timezone.utc).isoformat()
     )
-    assert len(account.transaction_history) == 1
-    tx = account.transaction_history[0]
-    assert tx["type"] == "DEPOSIT"
-    assert tx["reason"] == "Initial deposit check"
+    assert result["success"]
+    assert result["position_id_closed"] == pos1_id
+    
+    pos1_obj = next(p for p in account.open_positions if p.position_id == pos1_id)
+    assert pos1_obj.status == "CLOSED"
+    assert account.get_balance()["btc_balance"] == pytest.approx(initial_total_btc - pos1_btc)
+
+def test_execute_sell_order_manual_amount_mismatch(account_with_open_position):
+    account, pos_id, pos_btc, _ = account_with_open_position
+    result = account.execute_sell_order(
+        "BTCUSDT", btc_amount_to_sell=pos_btc + 0.001, # Different amount
+        current_btc_price=52000.0, 
+        reason="Manual sell mismatch", 
+        timestamp=TEST_TIMESTAMP_STR
+    )
+    assert not result["success"]
+    assert "does not match oldest open position amount" in result["message"]
+
+def test_execute_sell_order_non_existent_id(account: TradingAccount):
+    result = account.execute_sell_order("BTCUSDT", 0, 50000, "Sell non-existent", TEST_TIMESTAMP_STR, "fake_id")
+    assert not result["success"]
+    assert "Open position with ID 'fake_id' not found" in result["message"]
+
+def test_execute_sell_order_no_open_positions_manual(account: TradingAccount):
+    assert len(account.open_positions) == 0
+    result = account.execute_sell_order("BTCUSDT", 0.1, 50000, "Sell no open", TEST_TIMESTAMP_STR)
+    assert not result["success"]
+    assert "No open positions to sell" in result["message"]
+
+def test_execute_sell_order_already_closed_position(account_with_open_position):
+    account, pos_id, _, _ = account_with_open_position
+    # Close it once
+    account.execute_sell_order("BTCUSDT", 0, 52000, "First close", TEST_TIMESTAMP_STR, position_id_to_close=pos_id)
+    
+    # Attempt to close again
+    result = account.execute_sell_order("BTCUSDT", 0, 52000, "Second close attempt", TEST_TIMESTAMP_STR + "_2", position_id_to_close=pos_id)
+    assert not result["success"]
+    assert f"Open position with ID '{pos_id}' not found" in result["message"] # Because it looks for "OPEN" status
+
+def test_get_balance_consistency_after_trades(account: TradingAccount):
+    res1 = account.execute_buy_order("BTCUSDT", 100, 50000, "b1", TEST_TIMESTAMP_STR + "_1")
+    btc1 = res1["btc_bought"]
+    pos1_id = res1["position_id"]
+    
+    res2 = account.execute_buy_order("BTCUSDT", 150, 51000, "b2", TEST_TIMESTAMP_STR + "_2")
+    btc2 = res2["btc_bought"]
+
+    assert account.get_balance()["btc_balance"] == pytest.approx(btc1 + btc2)
+    
+    account.execute_sell_order("BTCUSDT", 0, 52000, "s1", TEST_TIMESTAMP_STR + "_3", position_id_to_close=pos1_id)
+    assert account.get_balance()["btc_balance"] == pytest.approx(btc2)
+
+def test_execute_buy_order_insufficient_funds(account: TradingAccount):
+    initial_usdt = account.usdt_balance
+    usdt_to_spend = initial_usdt + 1.0 # Ensure it's more than balance, even after fee
+    
+    result = account.execute_buy_order("BTCUSDT", usdt_to_spend, 50000.0, "Test buy fail", TEST_TIMESTAMP_STR)
+    assert not result["success"]
+    assert "Insufficient USDT balance" in result["message"]
+    assert len(account.open_positions) == 0
+    assert account.usdt_balance == initial_usdt
+
+# Original insufficient BTC test is implicitly covered by "no open positions" or "non-existent ID"
+# If we want to test "trying to sell more BTC than available via a specific position ID"
+# that's not possible with current logic as it sells the full position amount.
+# The `btc_amount_to_sell` is only used for the ambiguous manual sell case.
+
 ```

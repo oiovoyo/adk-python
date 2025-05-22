@@ -1,5 +1,5 @@
 import datetime
-from typing import Literal, AsyncGenerator, Any
+from typing import Literal, AsyncGenerator, Any, Optional, List # Added Optional, List
 
 from google_adk.agents import LlmAgent, BaseAgentResponse, LlmRequest
 from google_adk.tools import FunctionTool
@@ -29,101 +29,81 @@ class TradingDecision(BaseModel):
     reason: str = Field(
         description="Concise reasoning for the trading decision based on market data analysis."
     )
+    # New fields for SL/TP suggestions
+    suggested_stop_loss_percentage: Optional[float] = Field(
+        default=None, 
+        description="Suggested stop-loss as a percentage below entry price (e.g., 0.05 for 5%). Only for BUY action."
+    )
+    suggested_take_profit_percentage: Optional[float] = Field(
+        default=None, 
+        description="Suggested take-profit as a percentage above entry price (e.g., 0.10 for 10%). Only for BUY action."
+    )
 
 
 class TradingAgent(LlmAgent[TradingDecision, BaseAgentResponse[TradingDecision]]):
     """
     A cryptocurrency trading agent that analyzes market data and makes trading
     decisions (BUY, SELL, HOLD) for BTC/USDT to maximize USDT value.
+    It also manages open positions with stop-loss and take-profit levels.
     """
 
     def __init__(self, trading_account: TradingAccount, model_name: str = "gemini-1.5-flash"):
-        """
-        Initializes the TradingAgent.
-
-        Args:
-            trading_account: An instance of TradingAccount to manage funds and execute trades.
-            model_name: The name of the LLM model to use (e.g., "gemini-1.5-flash").
-        """
         self.trading_account = trading_account
         self.binance_data_tool = BinanceDataTool() 
 
         tools = [
-            FunctionTool(
-                func=self.binance_data_tool.get_ticker_price,
-                name="get_ticker_price",
-                description="Fetches the latest price for a cryptocurrency symbol from Binance. Example: {\"symbol\": \"BTCUSDT\"}"
-            ),
-            FunctionTool(
-                func=self.binance_data_tool.get_candlestick_data,
-                name="get_candlestick_data",
-                description="Fetches recent candlestick (k-line) data for a cryptocurrency symbol from Binance. Example: {\"symbol\": \"BTCUSDT\", \"interval\": \"1h\", \"limit\": 24}"
-            ),
-            FunctionTool( 
-                func=get_crypto_news, 
-                name="get_cryptocurrency_news",
-                description="Fetches recent news articles related to a specific cryptocurrency or market trend. Use queries like 'bitcoin price sentiment', 'ethereum new projects', or 'overall crypto market trends'. Example: {\"query\": \"bitcoin price sentiment\", \"num_results\": 3}"
-            ),
-            FunctionTool( # New Account Position Tool
-                func=self._get_current_account_position,
-                name="get_current_account_position",
-                description="Fetches the current balances of USDT and BTC in your trading account."
-            ),
-            FunctionTool( # New Trade History Tool
-                func=self._get_recent_trade_history,
-                name="get_recent_trade_history",
-                description="Fetches the last N simulated trade transactions. You can specify N (e.g., num_trades=5)."
-            )
+            FunctionTool(func=self.binance_data_tool.get_ticker_price, name="get_ticker_price", description="Fetches the latest price for a cryptocurrency symbol. Example: {\"symbol\": \"BTCUSDT\"}"),
+            FunctionTool(func=self.binance_data_tool.get_candlestick_data, name="get_candlestick_data", description="Fetches recent candlestick (k-line) data. Example: {\"symbol\": \"BTCUSDT\", \"interval\": \"1h\", \"limit\": 24}"),
+            FunctionTool(func=get_crypto_news, name="get_cryptocurrency_news", description="Fetches recent news articles. Example: {\"query\": \"bitcoin price sentiment\", \"num_results\": 3}"),
+            FunctionTool(func=self._get_current_account_position, name="get_current_account_position", description="Fetches current USDT and BTC balances."),
+            FunctionTool(func=self._get_recent_trade_history, name="get_recent_trade_history", description="Fetches the last N trades. Example: {\"num_trades\": 5}")
         ]
 
         self._original_instruction = """\
 You are a cryptocurrency trading analyst. Your goal is to maximize the USDT value of a simulated trading account.
 
-Before making any trading decision, you should first understand your current financial position and recent trading activity. Use these tools:
-1. `get_current_account_position()`: Fetches your current USDT and BTC balances.
-2. `get_recent_trade_history(num_trades: int = 5)`: Fetches your last N trades.
+**Process:**
+1.  **Assess Current Standing:** Use `get_current_account_position()` and `get_recent_trade_history(num_trades: int = 5)` to understand your current financial position and past actions.
+2.  **Analyze Market:** Use `get_ticker_price(symbol: str)`, `get_candlestick_data(...)`, and `get_cryptocurrency_news(...)` to gather market intelligence.
+3.  **Decide Action:** Based on all available data, decide whether to BUY BTC, SELL BTC, or HOLD.
 
-Then, analyze the market using:
-3. `get_ticker_price(symbol: str)`: Fetches the latest price for a cryptocurrency symbol.
-4. `get_candlestick_data(symbol: str, interval: str = '1h', limit: int = 24)`: Fetches recent candlestick (k-line) data.
-5. `get_cryptocurrency_news(query: str, num_results: int = 3)`: Fetches recent news articles. Use this to understand market sentiment or find news that might impact prices (e.g., query 'bitcoin price sentiment' or 'ethereum new regulations').
-
-Based on your analysis of all available data (your current position, past trades, ticker price, candlestick patterns, and relevant news), you must decide whether to BUY BTC, SELL BTC, or HOLD.
-
-Decision Guidelines:
-1.  If you decide to BUY BTC:
-    *   Specify the amount of USDT to spend (e.g., 'amount_usdt_to_spend: 200').
-    *   Try to use a reasonable portion of available USDT (e.g., 10% to 50%) if you identify a strong buying opportunity.
+**Decision Guidelines:**
+*   **BUY BTC:**
+    *   Specify `amount_usdt_to_spend` (e.g., 10-50% of available USDT if strong opportunity).
     *   Ensure `amount_btc_to_sell` is 0.
-2.  If you decide to SELL BTC:
-    *   Specify the amount of BTC to sell (e.g., 'amount_btc_to_sell: 0.01').
-    *   Try to sell a reasonable portion of available BTC if you identify a strong selling opportunity.
+    *   **Optionally, suggest risk management levels:**
+        *   `suggested_stop_loss_percentage`: e.g., 0.05 for 5% below your intended entry price.
+        *   `suggested_take_profit_percentage`: e.g., 0.10 for 10% above your intended entry price.
+        *   If not provided, default percentages will be applied.
+*   **SELL BTC:**
+    *   Specify `amount_btc_to_sell` (e.g., a portion of available BTC).
     *   Ensure `amount_usdt_to_spend` is 0.
-3.  If you decide to HOLD:
-    *   Both `amount_usdt_to_spend` and `amount_btc_to_sell` should be 0.
-    *   This is appropriate if no clear opportunity is present or the market is too volatile without clear direction.
+    *   (Stop-loss/take-profit are set at time of BUY).
+*   **HOLD:**
+    *   Set both `amount_usdt_to_spend` and `amount_btc_to_sell` to 0. Appropriate if no clear opportunity or high uncertainty.
 
-Reasoning:
-You MUST provide a clear and concise reason for your decision, based on your analysis of all available data.
+**Reasoning:**
+You MUST provide a clear and concise reason for your decision, integrating analysis from all data sources (account status, market data, news).
 
-Output Format:
-Your final decision MUST be structured as a JSON object conforming to the following schema:
+**Output Format (JSON):**
+```json
 {{
   "action": "BUY" | "SELL" | "HOLD",
-  "amount_usdt_to_spend": float (default 0.0),
-  "amount_btc_to_sell": float (default 0.0),
-  "reason": "Your concise analysis and reasoning for the decision."
+  "amount_usdt_to_spend": float,
+  "amount_btc_to_sell": float,
+  "reason": "Your concise analysis and reasoning.",
+  "suggested_stop_loss_percentage": float (optional, for BUY only, e.g., 0.05),
+  "suggested_take_profit_percentage": float (optional, for BUY only, e.g., 0.10)
 }}
+```
+Example BUY: {{"action": "BUY", "amount_usdt_to_spend": 200.0, "amount_btc_to_sell": 0.0, "reason": "Price at support, positive news.", "suggested_stop_loss_percentage": 0.03, "suggested_take_profit_percentage": 0.08}}
+Example SELL: {{"action": "SELL", "amount_usdt_to_spend": 0.0, "amount_btc_to_sell": 0.01, "reason": "Reached resistance, negative sentiment from news."}}
+Example HOLD: {{"action": "HOLD", "amount_usdt_to_spend": 0.0, "amount_btc_to_sell": 0.0, "reason": "Market consolidating, awaiting clearer signals."}}
 
-Example Decisions:
-- Buying: {{"action": "BUY", "amount_usdt_to_spend": 200.0, "amount_btc_to_sell": 0.0, "reason": "Account has 1000 USDT. Bitcoin price is at support 60000, RSI is oversold, and recent positive news about Bitcoin adoption suggests upward potential."}}
-- Selling: {{"action": "SELL", "amount_usdt_to_spend": 0.0, "amount_btc_to_sell": 0.01, "reason": "Account has 0.5 BTC. Bearish engulfing pattern on 1h chart at resistance 65000, coupled with negative regulatory news."}}
-- Holding: {{"action": "HOLD", "amount_usdt_to_spend": 0.0, "amount_btc_to_sell": 0.0, "reason": "Market is consolidating (61000-62000), news is mixed, current BTC holding is minimal, awaiting clearer signal."}}
-
-Always use your tools to get the latest market data and account status before making a decision.
+The system will automatically check for stop-loss/take-profit triggers on open positions before asking for your new decision.
 """
         super().__init__(
-            instruction=self._original_instruction, # This is now the static template
+            instruction=self._original_instruction,
             tools=tools,
             model=model_name,
             output_schema=TradingDecision,
@@ -132,83 +112,134 @@ Always use your tools to get the latest market data and account status before ma
 
     async def _run_async_impl(
         self,
-        request: LlmRequest,
+        request: LlmRequest, # The initial request that starts this agent run
         execution_context: Any | None = None
     ) -> AsyncGenerator[BaseAgentResponse[TradingDecision], None]:
-        """
-        Core logic for the TradingAgent.
-        The instruction is now static; LLM uses tools to get dynamic info.
-        """
-        # The dynamic instruction formatting block is removed.
-        # self.instruction is already set to self._original_instruction in __init__.
-        # If LlmAgent requires the instruction to be part of the request object for each run,
-        # then the calling code (or a callback like before_llm_request_callback)
-        # would be responsible for populating request.instruction.
-        # For this implementation, we assume LlmAgent uses self.instruction.
-
-        llm_decision_response: TradingDecision | None = None
         
+        # 1. Fetch Current Price for Risk Management
+        current_btc_price: Optional[float] = None
+        ticker_data = self.binance_data_tool.get_ticker_price(symbol="BTCUSDT") # Synchronous call
+        if "error" not in ticker_data and ticker_data.get("price"):
+            try:
+                current_btc_price = float(ticker_data["price"])
+            except ValueError:
+                yield BaseAgentResponse(
+                    response_type="agent_error",
+                    response_data={"error": f"Invalid price format from get_ticker_price: {ticker_data.get('price')}"},
+                    raw_request=request
+                )
+        else:
+            yield BaseAgentResponse(
+                response_type="agent_error",
+                response_data={"error": f"Failed to fetch current BTC price for risk management: {ticker_data.get('error', 'Unknown error')}"},
+                raw_request=request
+            )
+
+        # 2. Call Risk Management Check if price is available
+        if current_btc_price is not None:
+            risk_actions = self._check_and_trigger_risk_management_orders(current_btc_price)
+            for action_result in risk_actions:
+                if action_result.get("success"):
+                    yield BaseAgentResponse(
+                        response_type="risk_management_trade_executed", # Distinguishable event type
+                        response_data={
+                            "message": "Automatic risk management trade executed.",
+                            "trade_details": action_result
+                        },
+                        raw_request=request # Associate with the initial request
+                    )
+                else: # If SL/TP sell order failed for some reason (e.g. insufficient funds if logic error)
+                     yield BaseAgentResponse(
+                        response_type="risk_management_trade_error",
+                        response_data={
+                            "message": "Automatic risk management trade failed.",
+                            "error_details": action_result
+                        },
+                        raw_request=request
+                    )
+        
+        # 3. Proceed with existing LLM interaction loop (tools, decision making)
+        # The agent's instruction is static (self._original_instruction).
+        # LlmAgent's super()._run_async_impl handles tool calls based on LLM's requests.
+        llm_decision_response: TradingDecision | None = None
         async for event in super()._run_async_impl(request, execution_context):
-            yield event
+            yield event # Yield all events from the parent class (tool calls, intermediate LLM responses)
             if event.response_type == "llm_response" and event.response_data:
+                # Check if the response_data is already the parsed Pydantic model or a raw dict
                 if isinstance(event.response_data, TradingDecision):
                      llm_decision_response = event.response_data
-                elif isinstance(event.response_data, dict) and "action" in event.response_data:
+                elif isinstance(event.response_data, dict) and "action" in event.response_data: # If it's a dict from LLM
                     try:
                         llm_decision_response = TradingDecision(**event.response_data)
-                    except Exception:
+                    except Exception as pydantic_error:
                         yield BaseAgentResponse(
                             response_type="agent_error",
-                            response_data={"error": "LLM output did not conform to TradingDecision schema after tool use.", "raw_output": event.response_data},
+                            response_data={"error": f"LLM output did not conform to TradingDecision schema after tool use: {pydantic_error}", "raw_output": event.response_data},
                             raw_request=request,
                             raw_response=None 
                         )
-                        llm_decision_response = None
-                        break 
-        # No need to restore self.instruction as it wasn't changed for this specific run.
+                        llm_decision_response = None 
+                        break # Stop further processing if LLM output is invalid
 
+        # 4. Process the LLM's final decision
         if llm_decision_response:
             decision = llm_decision_response
             action_result_message = f"LLM Decision: {decision.action}. Reason: {decision.reason}"
             trade_executed = False
             current_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            trade_outcome_details = {}
 
             if decision.action == "BUY":
                 if decision.amount_usdt_to_spend > 0:
-                    # LLM should have used tools to get price, but for safety in simulation, re-fetch.
-                    ticker_data = self.binance_data_tool.get_ticker_price(symbol="BTCUSDT")
-                    if "error" not in ticker_data:
-                        current_btc_price = float(ticker_data["price"])
+                    price_data_for_trade = self.binance_data_tool.get_ticker_price(symbol="BTCUSDT")
+                    if "error" not in price_data_for_trade and price_data_for_trade.get("price"):
+                        current_price_for_trade = float(price_data_for_trade["price"])
+                        
+                        stop_loss_price: Optional[float] = None
+                        take_profit_price: Optional[float] = None
+
+                        if decision.suggested_stop_loss_percentage is not None and decision.suggested_stop_loss_percentage > 0:
+                            stop_loss_price = current_price_for_trade * (1 - decision.suggested_stop_loss_percentage)
+                        if decision.suggested_take_profit_percentage is not None and decision.suggested_take_profit_percentage > 0:
+                            take_profit_price = current_price_for_trade * (1 + decision.suggested_take_profit_percentage)
+                        
                         buy_outcome = self.trading_account.execute_buy_order(
                             symbol="BTCUSDT",
                             usdt_amount_to_spend=decision.amount_usdt_to_spend,
-                            current_btc_price=current_btc_price,
+                            current_btc_price=current_price_for_trade,
                             reason=decision.reason,
-                            timestamp=current_time
+                            timestamp=current_time,
+                            stop_loss_price=stop_loss_price,      # Pass calculated SL
+                            take_profit_price=take_profit_price   # Pass calculated TP
                         )
                         action_result_message += f"\nBuy Order Outcome: {buy_outcome['message']}"
                         trade_executed = buy_outcome["success"]
+                        trade_outcome_details = buy_outcome
                     else:
-                        action_result_message += f"\nCould not execute BUY: Failed to fetch current price - {ticker_data['error']}"
+                        action_result_message += f"\nCould not execute BUY: Failed to fetch current price for trade - {price_data_for_trade.get('error', 'Unknown error')}"
                 else:
                     action_result_message += "\nBuy action chosen, but amount_usdt_to_spend was zero. No trade executed."
             
             elif decision.action == "SELL":
-                if decision.amount_btc_to_sell > 0:
-                    ticker_data = self.binance_data_tool.get_ticker_price(symbol="BTCUSDT")
-                    if "error" not in ticker_data:
-                        current_btc_price = float(ticker_data["price"])
+                if decision.amount_btc_to_sell > 0: # For manual sell, LLM decides amount
+                    price_data_for_trade = self.binance_data_tool.get_ticker_price(symbol="BTCUSDT")
+                    if "error" not in price_data_for_trade and price_data_for_trade.get("price"):
+                        current_price_for_trade = float(price_data_for_trade["price"])
+                        # For SELL, LLM doesn't suggest SL/TP. It might specify a position_id to close,
+                        # but current TradingDecision doesn't include that. So, it's a market sell of oldest.
                         sell_outcome = self.trading_account.execute_sell_order(
                             symbol="BTCUSDT",
-                            btc_amount_to_sell=decision.amount_btc_to_sell,
-                            current_btc_price=current_btc_price,
+                            btc_amount_to_sell=decision.amount_btc_to_sell, # LLM specified amount
+                            current_btc_price=current_price_for_trade,
                             reason=decision.reason,
                             timestamp=current_time
+                            # position_id_to_close is not part of TradingDecision yet
                         )
                         action_result_message += f"\nSell Order Outcome: {sell_outcome['message']}"
                         trade_executed = sell_outcome["success"]
+                        trade_outcome_details = sell_outcome
                     else:
-                        action_result_message += f"\nCould not execute SELL: Failed to fetch current price - {ticker_data['error']}"
+                        action_result_message += f"\nCould not execute SELL: Failed to fetch current price for trade - {price_data_for_trade.get('error', 'Unknown error')}"
                 else:
                     action_result_message += "\nSell action chosen, but amount_btc_to_sell was zero. No trade executed."
             
@@ -224,18 +255,20 @@ Always use your tools to get the latest market data and account status before ma
                     "llm_decision": decision.model_dump(),
                     "action_result": action_result_message,
                     "trade_executed": trade_executed,
+                    "trade_details": trade_outcome_details, # Include details of the executed trade
                     "final_balances": final_balances
                 },
                 raw_request=request,
-                raw_response=llm_decision_response
+                raw_response=llm_decision_response 
             )
-        else:
-            yield BaseAgentResponse(
+        elif request.agent_id: # Ensure we yield something if no LLM decision was made but it's not an error from super()
+             yield BaseAgentResponse(
                 response_type="agent_error",
-                response_data={"error": "LLM did not produce a final TradingDecision."},
+                response_data={"error": "LLM did not produce a final TradingDecision or was interrupted."},
                 raw_request=request,
                 raw_response=None 
             )
+
 
     def _get_current_account_position(self) -> dict:
         """
@@ -248,13 +281,6 @@ Always use your tools to get the latest market data and account status before ma
         """
         Retrieves the most recent trades from the transaction history.
         This method is intended to be wrapped as a FunctionTool.
-
-        Args:
-            num_trades: The maximum number of recent trades to retrieve.
-                        Defaults to 5. If non-positive, no trades are returned.
-
-        Returns:
-            A dictionary containing the list of recent trades and the count.
         """
         if num_trades <= 0:
             history_slice = []
@@ -266,12 +292,42 @@ Always use your tools to get the latest market data and account status before ma
             "trades_returned": len(history_slice)
         }
 
-    # Example of using before_llm_request_callback for dynamic instructions
-    # if self.instruction modification in _run_async_impl is not preferred/supported.
-    # def before_llm_request_callback(self, request: LlmRequest) -> LlmRequest:
-    #     """Dynamically formats the instruction if needed (not used in current setup)."""
-    #     # This would be the place to inject dynamic info into request.instruction
-    #     # if self.instruction passed to super() was a static template not containing balances.
-    #     # However, current _original_instruction is now static and doesn't need balance formatting.
-    #     return request
+    def _check_and_trigger_risk_management_orders(self, current_price: float) -> List[dict]:
+        """
+        Checks all open positions and triggers sales if stop-loss or take-profit prices are met.
+        """
+        actions_taken: List[dict] = []
+        open_positions_to_check = [pos for pos in self.trading_account.open_positions if pos.status == "OPEN"]
+
+        for position in open_positions_to_check:
+            action_taken_for_this_position = False
+            current_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+            if position.stop_loss_price is not None and current_price <= position.stop_loss_price:
+                sell_outcome = self.trading_account.execute_sell_order(
+                    symbol=position.symbol,
+                    btc_amount_to_sell=position.amount_crypto,
+                    current_btc_price=current_price, # Use current_price for SL/TP execution
+                    reason="Stop-loss triggered",
+                    timestamp=current_time,
+                    position_id_to_close=position.position_id
+                )
+                actions_taken.append(sell_outcome)
+                action_taken_for_this_position = True 
+
+            if not action_taken_for_this_position and \
+               position.take_profit_price is not None and \
+               current_price >= position.take_profit_price:
+                sell_outcome = self.trading_account.execute_sell_order(
+                    symbol=position.symbol,
+                    btc_amount_to_sell=position.amount_crypto,
+                    current_btc_price=current_price, # Use current_price for SL/TP execution
+                    reason="Take-profit triggered",
+                    timestamp=current_time,
+                    position_id_to_close=position.position_id
+                )
+                actions_taken.append(sell_outcome)
+        
+        return actions_taken
+
 ```
