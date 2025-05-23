@@ -249,4 +249,3 @@ class TradingAccount:
             logger.error(f"An unexpected error occurred while loading TradingAccount state from {filepath}: {e}", exc_info=True)
             return False
 
-```
