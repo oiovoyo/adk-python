@@ -62,3 +62,4 @@ class BinanceDataTool:
             logger.warning(f"Failed to fetch candlestick data for {symbol} (interval {interval}): {e}", exc_info=True) # Added exc_info
             return {"error": f"An unexpected error occurred while fetching klines for {symbol}: {str(e)}"}
 
+```

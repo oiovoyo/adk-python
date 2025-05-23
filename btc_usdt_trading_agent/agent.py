@@ -2,8 +2,8 @@ import datetime
 from typing import Literal, AsyncGenerator, Any, Optional, List 
 import logging # Added
 
-from google.adk.agents import LlmAgent
-from google.adk.tools import FunctionTool
+from google_adk.agents import LlmAgent, BaseAgentResponse, LlmRequest
+from google_adk.tools import FunctionTool
 from pydantic import BaseModel, Field
 
 from btc_usdt_trading_agent.tools.binance_data_tool import BinanceDataTool
@@ -268,3 +268,4 @@ The system will automatically check for stop-loss/take-profit triggers on open p
             history_slice = self.trading_account.transaction_history[-num_trades:]
         
         return {"trade_history": history_slice, "trades_returned": len(history_slice)}
+```

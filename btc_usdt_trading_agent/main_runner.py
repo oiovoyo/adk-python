@@ -10,7 +10,6 @@ from google.adk.runners import InMemoryRunner
 from google.adk.events import Event 
 from google.genai.types import Content, Part # For constructing user_message
 
-
 # Project Imports
 from btc_usdt_trading_agent.account.trading_account import TradingAccount
 # Import local AgentEventContent and TradingDecision from agent.py
@@ -220,4 +219,4 @@ if __name__ == "__main__":
         logger.info("Main runner interrupted by user (KeyboardInterrupt). Exiting.")
     except Exception as e:
         logger.error(f"An unexpected error occurred in main: {e}", exc_info=True)
-
+```

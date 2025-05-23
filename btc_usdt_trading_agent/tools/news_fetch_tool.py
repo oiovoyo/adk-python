@@ -87,3 +87,4 @@ async def get_crypto_news(query: str, num_results: int = 3) -> dict:
         logger.error(f"Error fetching/processing news for query '{query}': {e}", exc_info=True) 
         return {"error": f"Failed to fetch or process news: {str(e)}"}
 
+```

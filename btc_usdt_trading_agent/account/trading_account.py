@@ -223,18 +223,18 @@ class TradingAccount:
             with open(filepath, 'r') as f:
                 loaded_data = json.load(f)
             
-            self.usdt_balance = loaded_data.get("usdt_balance", self.usdt_balance) # Keep current if key missing
+            self.usdt_balance = loaded_data.get("usdt_balance", self.usdt_balance) 
             self.transaction_history = loaded_data.get("transaction_history", [])
             
             loaded_positions_data = loaded_data.get("open_positions", [])
-            self.open_positions = [] # Clear existing before loading
+            self.open_positions = [] 
             for pos_data in loaded_positions_data:
                 try:
                     self.open_positions.append(OpenPosition(**pos_data))
-                except Exception as e: # Catch Pydantic validation errors or other issues
+                except Exception as e: 
                     logger.warning(f"Could not load an open position due to data error: {pos_data}. Error: {e}", exc_info=True)
 
-            self.btc_balance = self._calculate_total_btc_in_open_positions() # Recalculate total BTC
+            self.btc_balance = self._calculate_total_btc_in_open_positions() 
 
             logger.info(f"TradingAccount state successfully loaded from {filepath}. Balance: USDT {self.usdt_balance:.2f}, BTC {self.btc_balance:.8f}")
             logger.debug(f"Loaded {len(self.open_positions)} positions and {len(self.transaction_history)} transactions.")
@@ -245,7 +245,7 @@ class TradingAccount:
         except IOError as e:
             logger.error(f"Failed to load TradingAccount state from {filepath} due to IOError: {e}", exc_info=True)
             return False
-        except Exception as e: # Catch any other unexpected errors during loading
+        except Exception as e: 
             logger.error(f"An unexpected error occurred while loading TradingAccount state from {filepath}: {e}", exc_info=True)
             return False
-
+```
