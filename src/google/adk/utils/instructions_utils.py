@@ -14,6 +14,7 @@
 
 import re
 
+from ..agents.invocation_context import InvocationContext
 from ..agents.readonly_context import ReadonlyContext
 from ..sessions.state import State
 

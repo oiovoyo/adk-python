@@ -17,11 +17,12 @@
 import enum
 from typing import Optional
 from typing import Union
-from unittest import mock
 
 from google.adk.artifacts import GcsArtifactService
 from google.adk.artifacts import InMemoryArtifactService
 from google.genai import types
+
+from unittest import mock
 import pytest
 
 Enum = enum.Enum
