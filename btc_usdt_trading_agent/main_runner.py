@@ -1,12 +1,14 @@
 import logging
 import asyncio
 import datetime 
+import json # Added
+import os   # Added
 from typing import Optional, List, Dict, Any 
 
 # ADK Imports
 from google_adk.runners import InMemoryRunner
-from google_adk.agents import BaseAgentResponse, Event # LlmRequest is not directly used by runner.run_async
-from google_adk.models.llm_request import Content, Part # Corrected import for Content/Part
+from google_adk.agents import BaseAgentResponse, Event 
+from google_adk.models.llm_request import Content, Part 
 
 # Project Imports
 from btc_usdt_trading_agent.account.trading_account import TradingAccount
@@ -81,17 +83,66 @@ class InteractionHistory:
 
     def display_history(self) -> None:
         if not self.history:
-            logger.info("Interaction history is empty.") # Use logger
+            self._logger.info("Interaction history is empty.") # Use self._logger
             return
         
-        logger.info("\n--- Interaction History ---")
+        self._logger.info("\n--- Interaction History ---") # Use self._logger
         for record in self.history:
             log_message = f"[{record['timestamp']}] [{record['type']}]\n"
             for key, value in record['details'].items():
                 log_message += f"  {key}: {value}\n"
             log_message += ("-" * 20)
-            logger.info(log_message) # Use logger for display as well
-        logger.info("--- End of History ---\n")
+            self._logger.info(log_message) # Use self._logger
+        self._logger.info("--- End of History ---\n") # Use self._logger
+
+    def save_history(self, filepath: str) -> bool:
+        """Saves the current interaction history to a JSON file."""
+        self._logger.debug(f"Attempting to save interaction history to {filepath}")
+        try:
+            with open(filepath, 'w') as f:
+                json.dump(self.history, f, indent=4)
+            self._logger.info(f"Interaction history saved successfully to {filepath}. {len(self.history)} records saved.")
+            return True
+        except IOError as e:
+            self._logger.error(f"Failed to save interaction history to {filepath} due to IOError: {e}", exc_info=True)
+            return False
+        except Exception as e:
+            self._logger.error(f"An unexpected error occurred while saving interaction history to {filepath}: {e}", exc_info=True)
+            return False
+
+    def load_history(self, filepath: str) -> bool:
+        """Loads the interaction history from a JSON file."""
+        self._logger.debug(f"Attempting to load interaction history from {filepath}")
+        if not os.path.exists(filepath):
+            self._logger.warning(f"Interaction history file {filepath} not found. Starting with an empty or current history.")
+            return False
+        
+        try:
+            with open(filepath, 'r') as f:
+                loaded_data = json.load(f)
+            
+            if not isinstance(loaded_data, list):
+                self._logger.error(f"Failed to load history: Data in {filepath} is not a list.", exc_info=True)
+                return False
+
+            self.history = loaded_data
+            
+            # Enforce max_turns after loading
+            while len(self.history) > self.max_turns:
+                removed_record = self.history.pop(0)
+                self._logger.debug(f"Loaded history exceeded max_turns ({self.max_turns}). Removed oldest record: {removed_record.get('type')} from {removed_record.get('timestamp')}")
+
+            self._logger.info(f"Interaction history successfully loaded from {filepath}. Loaded {len(self.history)} records (respecting max_turns={self.max_turns}).")
+            return True
+        except json.JSONDecodeError as e:
+            self._logger.error(f"Failed to load interaction history from {filepath} due to JSON decoding error: {e}", exc_info=True)
+            return False
+        except IOError as e:
+            self._logger.error(f"Failed to load interaction history from {filepath} due to IOError: {e}", exc_info=True)
+            return False
+        except Exception as e:
+            self._logger.error(f"An unexpected error occurred while loading interaction history from {filepath}: {e}", exc_info=True)
+            return False
 
 
 async def main():
@@ -107,15 +158,22 @@ async def main():
     trading_agent = TradingAgent(trading_account=trading_account)
     logger.info("TradingAgent initialized.")
 
-    # InMemoryRunner does not take app_name directly in constructor.
-    # It's more of a conceptual grouping if used with a broader system.
     runner = InMemoryRunner(agent=trading_agent)
     logger.info("InMemoryRunner initialized.")
 
     history_manager = InteractionHistory(max_turns=20)
     logger.info(f"InteractionHistory initialized with max_turns={history_manager.max_turns}.")
 
-    num_cycles = 3 # Configurable number of trading cycles
+    # --- Example: Load history at start if available ---
+    # history_filepath = "interaction_history.json"
+    # if history_manager.load_history(history_filepath):
+    #     logger.info("Previously saved interaction history loaded.")
+    #     history_manager.display_history()
+    # else:
+    #     logger.info("No previous interaction history found or failed to load.")
+
+
+    num_cycles = 3 
     logger.info(f"Starting trading simulation for {num_cycles} cycles.")
 
     for i in range(num_cycles):
@@ -132,7 +190,7 @@ async def main():
         logger.info(f"Cycle {cycle_number}: User trigger sent to agent.")
 
         try:
-            session_id = f"session_cycle_{cycle_number}" # New session for each cycle for fresh context
+            session_id = f"session_cycle_{cycle_number}" 
             user_id = "test_user"
             
             async for event in runner.run_async(user_id=user_id, session_id=session_id, new_message=user_message):
@@ -158,7 +216,7 @@ async def main():
 
                 elif event.is_final_response() and isinstance(event.content, BaseAgentResponse):
                     if event.content.response_type == "agent_action_summary":
-                        summary_data = event.content.data # This is the dict from TradingAgent
+                        summary_data = event.content.data 
                         llm_decision = summary_data.get("llm_decision", {})
                         action_result = summary_data.get("action_result", "No action result provided.")
                         
@@ -177,10 +235,9 @@ async def main():
                         error_data = event.content.data if isinstance(event.content.data, dict) else {"raw_error": str(event.content.data)}
                         logger.error(f"Cycle {cycle_number}: Agent reported an error: {error_data.get('error', 'Unknown agent error')}")
                         history_manager.add_record("AGENT_ERROR", error_data)
-                elif event.is_final_response(): # Catch other final responses not matching BaseAgentResponse
+                elif event.is_final_response(): 
                     logger.info(f"Cycle {cycle_number}: Agent final response (unstructured): {event.content}")
                     history_manager.add_record("AGENT_FINAL_UNSTRUCTURED", {"content": str(event.content)})
-
 
         except Exception as e:
             logger.error(f"Cycle {cycle_number}: An error occurred during agent run: {e}", exc_info=True)
@@ -190,18 +247,22 @@ async def main():
         logger.info(f"Cycle {cycle_number}: Account balance: USDT: {current_cycle_balance['usdt_balance']:.2f}, BTC: {current_cycle_balance['btc_balance']:.8f}")
         logger.info(f"--- End of Trading Cycle {cycle_number}/{num_cycles} ---")
         
-        if i < num_cycles - 1: # Don't sleep after the last cycle
-            await asyncio.sleep(2) # Simulate time passing
+        if i < num_cycles - 1: 
+            await asyncio.sleep(2) 
 
     final_balance = trading_account.get_balance()
     logger.info(f"Trading simulation completed. Final Account Balance: USDT: {final_balance['usdt_balance']:.2f}, BTC: {final_balance['btc_balance']:.8f}")
+    
+    # --- Example: Save history at end ---
+    # if history_manager.save_history(history_filepath):
+    #     logger.info(f"Interaction history saved to {history_filepath}")
     
     history_manager.display_history()
     logger.info("Main function completed.")
 
 
 if __name__ == "__main__":
-    setup_logging(log_level=logging.INFO) # INFO for normal run, DEBUG for more verbosity
+    setup_logging(log_level=logging.INFO) 
     
     try:
         asyncio.run(main())
@@ -209,4 +270,5 @@ if __name__ == "__main__":
         logger.info("Main runner interrupted by user (KeyboardInterrupt). Exiting.")
     except Exception as e:
         logger.error(f"An unexpected error occurred in main: {e}", exc_info=True)
+
 ```
