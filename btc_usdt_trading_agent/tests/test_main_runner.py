@@ -120,5 +120,3 @@ def test_setup_logging_configures_handlers(caplog):
         mock_file_handler_class.assert_called_once_with("test_dummy.log", mode='a')
         
     assert "Logging setup complete." in caplog.text
-
-```
