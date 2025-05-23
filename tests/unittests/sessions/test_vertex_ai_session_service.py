@@ -24,6 +24,7 @@ from google.adk.sessions import VertexAiSessionService
 from google.genai import types
 import pytest
 
+
 MOCK_SESSION_JSON_1 = {
     'name': (
         'projects/test-project/locations/test-location/'

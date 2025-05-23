@@ -1,10 +1,8 @@
-import logging
-import sys
-from unittest.mock import ANY
-from unittest.mock import patch
-
-from google.adk.agents.run_config import RunConfig
 import pytest
+import sys
+import logging
+from unittest.mock import patch, ANY
+from google.adk.agents.run_config import RunConfig
 
 
 def test_validate_max_llm_calls_valid():
