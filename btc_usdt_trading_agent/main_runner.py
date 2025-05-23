@@ -6,9 +6,9 @@ import os   # Added
 from typing import Optional, List, Dict, Any 
 
 # ADK Imports
-from google_adk.runners import InMemoryRunner
-from google_adk.agents import BaseAgentResponse, Event 
-from google_adk.models.llm_request import Content, Part 
+from google.adk.runners import InMemoryRunner
+from google.adk.agents import BaseAgentResponse, Event
+from google.adk.models.llm_request import Content, Part
 
 # Project Imports
 from btc_usdt_trading_agent.account.trading_account import TradingAccount
@@ -271,4 +271,3 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"An unexpected error occurred in main: {e}", exc_info=True)
 
-```

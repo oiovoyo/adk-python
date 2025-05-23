@@ -3,8 +3,8 @@ import pytest_asyncio
 import datetime
 from unittest.mock import AsyncMock, MagicMock, patch 
 
-from google_adk.agents import InvocationContext, RunConfig, Event, Part, Content, FunctionCall, LlmRequest, LlmAgent
-from google_adk.sessions import Session 
+from google.adk.agents import InvocationContext, RunConfig, Event, Part, Content, FunctionCall, LlmRequest, LlmAgent
+from google.adk.sessions import Session
 
 from btc_usdt_trading_agent.account.trading_account import TradingAccount
 from btc_usdt_trading_agent.agent import TradingAgent, TradingDecision

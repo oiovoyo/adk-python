@@ -3,8 +3,8 @@ import pytest_asyncio
 import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from google_adk.agents import Event, BaseAgentResponse # LlmRequest, Content, Part not directly used in this test's mocks but good to remember
-from google_adk.models.llm_request import Content, Part # For constructing mock events if needed
+from google.adk.agents import Event, BaseAgentResponse # LlmRequest, Content, Part not directly used in this test's mocks but good to remember
+from google.adk.models.llm_request import Content, Part # For constructing mock events if needed
 
 # Module to be tested
 from btc_usdt_trading_agent import main_runner 
