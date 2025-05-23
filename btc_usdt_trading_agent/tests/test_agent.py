@@ -11,7 +11,7 @@ from google.adk.runners import InvocationContext, RunConfig
 from google.adk.sessions import Session 
 from google.genai.types import Content, Part, FunctionCall 
 
-
+# Project Imports
 from btc_usdt_trading_agent.account.trading_account import TradingAccount
 # Import local AgentEventContent and TradingDecision from agent.py
 from btc_usdt_trading_agent.agent import TradingAgent, TradingDecision, AgentEventContent 
@@ -314,3 +314,5 @@ async def test_agent_trade_execution_price_fetch_fails_direct_llm(
     assert summary_event.content.response_type == "agent_action_summary"
     assert summary_event.content.data["trade_executed"] is False
     assert "Could not execute BUY: Failed to fetch current price for trade - API is down for trade exec" in summary_event.content.data["action_result"]
+
+```
