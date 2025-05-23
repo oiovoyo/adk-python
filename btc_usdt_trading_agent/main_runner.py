@@ -5,11 +5,10 @@ import json
 import os   
 from typing import Optional, List, Dict, Any 
 
-# ADK Imports
-from google_adk.runners import InMemoryRunner
-from google_adk.events import Event # Updated
-# from google_adk.agents import BaseAgentResponse # Removed
-from google.genai.types import Content, Part # Updated
+# Corrected ADK Imports
+from google.adk.runners import InMemoryRunner
+from google.adk.events import Event 
+from google.genai.types import Content, Part # For constructing user_message
 
 # Project Imports
 from btc_usdt_trading_agent.account.trading_account import TradingAccount
@@ -161,7 +160,9 @@ async def main():
                     
                     event_data_for_history = {"author": event.author, "is_final": event.is_final_response()}
                     
-                    if isinstance(event.content, AgentEventContent): # Check against local AgentEventContent
+                    # Check if content is our local AgentEventContent (for custom agent events)
+                    # or TradingDecision (for direct LLM output via output_schema)
+                    if isinstance(event.content, AgentEventContent): # Updated to local AgentEventContent
                         agent_event_content = event.content
                         event_data_for_history["response_type"] = agent_event_content.response_type
                         event_data_for_history["data_summary"] = str(agent_event_content.data)[:200]
@@ -178,7 +179,7 @@ async def main():
                             logger.error(f"Cycle {cycle_number}: Agent error: {agent_event_content.data.get('error', 'Unknown')}")
                     
                     elif isinstance(event.content, TradingDecision) and event.is_final_response():
-                        logger.info(f"Cycle {cycle_number}: Direct LLM TradingDecision received (should be wrapped by agent): {event.content}")
+                        logger.info(f"Cycle {cycle_number}: Direct LLM TradingDecision received: {event.content}")
                         event_data_for_history["llm_decision_direct"] = event.content.model_dump()
                     
                     elif event.content and event.content.parts: 
